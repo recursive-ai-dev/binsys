@@ -1,0 +1,1028 @@
+#!/bin/sh
+#═══════════════════════════════════════════════════════════════════════════════
+#  /usr/bin/plugin-ctl — FrugalOS Plugin Manager
+#  Runtime  : busybox ash | x86_64  (zero bashisms)
+#  Requires : losetup, mount, umount, mksquashfs (for build), fuser
+#
+#  Commands
+#  ─────────────────────────────────────────────────────────────────────────
+#  plugin-ctl list    [active|available|boot|all]
+#  plugin-ctl info    <name>
+#  plugin-ctl load    <name>                   hot-load from available/
+#  plugin-ctl unload  <name>                   hot-unload  (LIFO enforced)
+#  plugin-ctl enable  <name>                   mark for boot autoload
+#  plugin-ctl disable <name>                   remove from boot autoload
+#  plugin-ctl check   <name>                   dep-check without loading
+#  plugin-ctl build   <stagedir> <name> [ver]  pack directory → .sfs
+#  plugin-ctl verify  <name|path>              squashfs integrity check
+#  plugin-ctl reload  <name>                   unload + load (dev cycle)
+#═══════════════════════════════════════════════════════════════════════════════
+
+set -e
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export PATH
+
+#───────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+#───────────────────────────────────────────────────────────────────────────────
+
+PLUGIN_STATE="/run/plugin-state"
+PLUGIN_LOOPS="/run/plugin-loops"
+HOTLOAD_WORK="/run/hotload-work"
+
+# These are read from overlay.env at runtime
+BOOT_MOUNT=""
+BOOT_DEV=""
+UPPER_DIR=""
+WORK_DIR=""
+
+# Populated after _load_env
+PLUGINS_ENABLED=""
+PLUGINS_AVAILABLE=""
+
+# Directories inside a .sfs that we consider for overmounting.
+# Order matters: mount in this order so depmod finds lib before bin, etc.
+STD_DIRS="
+usr/lib
+usr/lib64
+usr/libexec
+usr/include
+usr/share
+usr/bin
+usr/sbin
+etc
+opt
+"
+
+#───────────────────────────────────────────────────────────────────────────────
+# COLOUR + LOGGING
+#───────────────────────────────────────────────────────────────────────────────
+
+_has_colour() { [ -t 1 ] && command -v tput >/dev/null 2>&1; }
+
+if _has_colour; then
+    C_RED='\033[1;31m';  C_GRN='\033[1;32m'; C_YEL='\033[1;33m'
+    C_BLU='\033[1;34m';  C_CYN='\033[1;36m'; C_WHT='\033[1;37m'
+    C_DIM='\033[0;37m';  C_RST='\033[0m'
+else
+    C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_WHT=''; C_DIM=''; C_RST=''
+fi
+
+log()  { printf "${C_GRN}=>${C_RST} %s\n" "$*"; }
+info() { printf "${C_BLU}  %s${C_RST}\n" "$*"; }
+warn() { printf "${C_YEL}  warn:${C_RST} %s\n" "$*" >&2; }
+err()  { printf "${C_RED}  error:${C_RST} %s\n" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+ok()   { printf "${C_GRN}  ✓${C_RST} %s\n" "$*"; }
+fail() { printf "${C_RED}  ✗${C_RST} %s\n" "$*" >&2; }
+
+#───────────────────────────────────────────────────────────────────────────────
+# ENVIRONMENT BOOTSTRAP
+# Read overlay.env written by /init — all path knowledge lives there
+#───────────────────────────────────────────────────────────────────────────────
+
+_load_env() {
+    local env_file="${PLUGIN_STATE}/overlay.env"
+    [ -f "$env_file" ] \
+        || die "overlay.env missing at $env_file — was this system booted with FrugalOS /init?"
+
+    # shellcheck disable=SC1090
+    . "$env_file"
+
+    [ -n "$BOOT_MOUNT" ] || die "BOOT_MOUNT not set in overlay.env"
+    [ -n "$UPPER_DIR"  ] || die "UPPER_DIR not set in overlay.env"
+
+    PLUGINS_ENABLED="${BOOT_MOUNT}/plugins/enabled"
+    PLUGINS_AVAILABLE="${BOOT_MOUNT}/plugins/available"
+
+    # Ensure working directories exist
+    mkdir -p "$PLUGIN_LOOPS" "$HOTLOAD_WORK" "${PLUGIN_STATE}/overmounts"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# ROOT CHECK
+#───────────────────────────────────────────────────────────────────────────────
+
+_require_root() {
+    [ "$(id -u)" = "0" ] \
+        || die "plugin-ctl: operation requires root"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# PATH HELPERS
+#───────────────────────────────────────────────────────────────────────────────
+
+# Convert a slash-path to underscore for use in filenames
+# e.g. "usr/bin" → "usr_bin"
+_dirsafe() { printf '%s' "$1" | tr '/' '_'; }
+
+# Resolve a plugin name to its .sfs path in available/ or enabled/
+# Prints the path if found, nothing if not.
+_resolve_sfs() {
+    local name="$1"
+    local sfs
+
+    # Accept explicit paths
+    [ -f "$name" ] && { printf '%s' "$name"; return 0; }
+
+    # Try .sfs extension if not given
+    local bare
+    bare="${name%.sfs}"
+
+    for dir in "$PLUGINS_AVAILABLE" "$PLUGINS_ENABLED"; do
+        [ -d "$dir" ] || continue
+        sfs="${dir}/${bare}.sfs"
+        [ -f "$sfs" ] && { printf '%s' "$sfs"; return 0; }
+    done
+
+    return 1
+}
+
+# Check if a plugin is currently active (boot-loaded or hot-loaded)
+_is_active() {
+    local name="${1%.sfs}"
+    grep -q "^${name}|" "${PLUGIN_STATE}/active.list" 2>/dev/null
+}
+
+# Check if a plugin is hot-loaded (not boot-loaded)
+_is_hotloaded() {
+    local name="${1%.sfs}"
+    grep -q "^${name}|.*|hot$" "${PLUGIN_STATE}/active.list" 2>/dev/null
+}
+
+# Get the loop device for an active plugin
+_get_loopdev() {
+    local name="${1%.sfs}"
+    grep "^${name}|" "${PLUGIN_STATE}/active.list" 2>/dev/null \
+        | cut -d'|' -f2
+}
+
+# Get the mountpoint for an active plugin
+_get_mountpoint() {
+    local name="${1%.sfs}"
+    grep "^${name}|" "${PLUGIN_STATE}/active.list" 2>/dev/null \
+        | cut -d'|' -f3
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# MANIFEST OPERATIONS
+# Manifests live at /.plugin/manifest inside each .sfs
+# They are plain key=value files, ash-sourceable
+#───────────────────────────────────────────────────────────────────────────────
+
+# Mount an .sfs temporarily, run a callback with the mountpoint, unmount.
+# Usage: _with_sfs_mount <sfs_path> <callback_fn> [args...]
+_with_sfs_mount() {
+    local sfs_path="$1"; shift
+    local callback="$1"; shift
+
+    local tmp_mnt loop_dev
+
+    tmp_mnt=$(mktemp -d /tmp/plugin-ctl-XXXXXX) \
+        || die "cannot create temp directory"
+
+    loop_dev=$(losetup -f 2>/dev/null) \
+        || { rm -rf "$tmp_mnt"; die "no free loop devices"; }
+
+    losetup -r "$loop_dev" "$sfs_path" 2>/dev/null \
+        || { rm -rf "$tmp_mnt"; die "losetup failed for $sfs_path"; }
+
+    if ! mount -t squashfs -o ro "$loop_dev" "$tmp_mnt" 2>/dev/null; then
+        losetup -d "$loop_dev" 2>/dev/null
+        rm -rf "$tmp_mnt"
+        die "cannot mount squashfs: $sfs_path"
+    fi
+
+    # Run callback with mountpoint as first arg
+    "$callback" "$tmp_mnt" "$@"
+    local ret=$?
+
+    umount "$tmp_mnt"  2>/dev/null || true
+    losetup -d "$loop_dev" 2>/dev/null || true
+    rm -rf "$tmp_mnt"
+
+    return $ret
+}
+
+# Read a single manifest field from a mounted plugin dir
+# Usage: _manifest_field <mountpoint> <FIELD_NAME>
+_manifest_field() {
+    local mnt="$1" field="$2"
+    local manifest="${mnt}/.plugin/manifest"
+    [ -f "$manifest" ] || return 1
+    # Source in clean subshell, unset to catch absence
+    (
+        unset NAME VERSION DESCRIPTION ARCH DEPENDS CONFLICTS \
+              PROVIDES LOAD_ORDER HOOK_LOAD HOOK_UNLOAD
+        # shellcheck disable=SC1090
+        . "$manifest" 2>/dev/null
+        eval "printf '%s' \"\${${field}}\""
+    )
+}
+
+# Print full manifest as formatted table from a mounted dir
+_print_manifest() {
+    local mnt="$1"
+    local manifest="${mnt}/.plugin/manifest"
+    if [ ! -f "$manifest" ]; then
+        printf '  %s(no manifest found)%s\n' "$C_DIM" "$C_RST"
+        return
+    fi
+    (
+        unset NAME VERSION DESCRIPTION ARCH DEPENDS CONFLICTS \
+              PROVIDES LOAD_ORDER HOOK_LOAD HOOK_UNLOAD
+        # shellcheck disable=SC1090
+        . "$manifest" 2>/dev/null
+        printf "  ${C_WHT}%-16s${C_RST} %s\n"  "Name:"        "${NAME:-?}"
+        printf "  ${C_WHT}%-16s${C_RST} %s\n"  "Version:"     "${VERSION:-?}"
+        printf "  ${C_WHT}%-16s${C_RST} %s\n"  "Description:" "${DESCRIPTION:-}"
+        printf "  ${C_WHT}%-16s${C_RST} %s\n"  "Arch:"        "${ARCH:-x86_64}"
+        printf "  ${C_WHT}%-16s${C_RST} %s\n"  "Depends:"     "${DEPENDS:-none}"
+        printf "  ${C_WHT}%-16s${C_RST} %s\n"  "Provides:"    "${PROVIDES:-}"
+        printf "  ${C_WHT}%-16s${C_RST} %s\n"  "Load Order:"  "${LOAD_ORDER:-50}"
+        printf "  ${C_WHT}%-16s${C_RST} %s\n"  "Conflicts:"   "${CONFLICTS:-none}"
+        [ -n "$HOOK_LOAD"   ] && printf "  ${C_WHT}%-16s${C_RST} %s\n" "On Load:"  "$HOOK_LOAD"
+        [ -n "$HOOK_UNLOAD" ] && printf "  ${C_WHT}%-16s${C_RST} %s\n" "On Unload:" "$HOOK_UNLOAD"
+    )
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# DEPENDENCY RESOLUTION
+# DEPENDS is space-separated plugin names in the manifest.
+# At load time: every dep must be active. Auto-load from available/ if not.
+# LOAD_ORDER of a dep must be < LOAD_ORDER of the requester.
+#───────────────────────────────────────────────────────────────────────────────
+
+# Check deps for a mounted plugin dir. Prints missing dep names.
+# Returns 1 if any dep is missing AND cannot be auto-loaded.
+_check_deps_from_mount() {
+    local mnt="$1"
+    local depends
+    depends=$(_manifest_field "$mnt" "DEPENDS")
+    local missing=0
+
+    for dep in $depends; do
+        [ -z "$dep" ] && continue
+        if _is_active "$dep"; then
+            ok "dep: $dep (active)"
+        else
+            # Attempt to find in available/
+            local dep_sfs
+            dep_sfs=$(_resolve_sfs "$dep" 2>/dev/null) || true
+            if [ -n "$dep_sfs" ]; then
+                warn "dep: $dep not active — will auto-load"
+                printf '%s\n' "$dep"   # caller decides whether to load
+            else
+                fail "dep: $dep — NOT FOUND in active or available plugins"
+                missing=$((missing + 1))
+            fi
+        fi
+    done
+
+    return $missing
+}
+
+# Resolve and auto-load all missing deps for a given .sfs path
+# Returns 0 if all deps satisfied (or loaded), 1 if any unresolvable
+_resolve_and_load_deps() {
+    local sfs_path="$1"
+
+    local missing_deps
+    missing_deps=$(_with_sfs_mount "$sfs_path" _check_deps_from_mount) || {
+        err "dependency check failed — unresolvable deps"
+        return 1
+    }
+
+    for dep in $missing_deps; do
+        log "auto-loading dependency: $dep"
+        cmd_load "$dep" || {
+            err "failed to auto-load dependency: $dep"
+            return 1
+        }
+    done
+
+    return 0
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# CONFLICT CHECK
+# CONFLICTS is space-separated plugin names. If any are active, abort.
+#───────────────────────────────────────────────────────────────────────────────
+
+_check_conflicts_from_mount() {
+    local mnt="$1"
+    local conflicts
+    conflicts=$(_manifest_field "$mnt" "CONFLICTS")
+    local found=0
+
+    for conflict in $conflicts; do
+        [ -z "$conflict" ] && continue
+        if _is_active "$conflict"; then
+            fail "conflict: $conflict is active — cannot load"
+            found=$((found + 1))
+        fi
+    done
+    return $found
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# KERNEL MODULES
+# A plugin may ship /.plugin/modules — one module name per line.
+# Called after the plugin's squashfs is in place.
+#───────────────────────────────────────────────────────────────────────────────
+
+_load_plugin_modules() {
+    local plugin_mnt="$1"
+    local modules_file="${plugin_mnt}/.plugin/modules"
+    [ -f "$modules_file" ] || return 0
+
+    log "loading kernel modules"
+    depmod -a 2>/dev/null || true
+
+    while IFS= read -r mod; do
+        [ -z "$mod" ] && continue
+        case "$mod" in '#'*) continue ;; esac
+        modprobe "$mod" 2>/dev/null && ok "$mod" || warn "modprobe $mod failed (may already be loaded)"
+    done < "$modules_file"
+}
+
+_unload_plugin_modules() {
+    local plugin_mnt="$1"
+    local modules_file="${plugin_mnt}/.plugin/modules"
+    [ -f "$modules_file" ] || return 0
+
+    # Reverse order for unload (dependencies last)
+    local mods
+    mods=$(awk '{lines[NR]=$0} END {for(i=NR;i>=1;i--) print lines[i]}' "$modules_file")
+
+    for mod in $mods; do
+        [ -z "$mod" ] && continue
+        case "$mod" in '#'*) continue ;; esac
+        modprobe -r "$mod" 2>/dev/null || warn "modprobe -r $mod failed (may be in use)"
+    done
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# OVERMOUNT ENGINE
+# Core of hot-loading. For each standard directory that exists in the plugin,
+# we mount a new overlay on top of the live system directory.
+#
+# Stack for a single directory after loading plugin B on top of plugin A:
+#
+#   /usr/bin  ←  overlay(upper=B_work, lower=B_plugin/usr/bin:A_overlay)
+#   A_overlay ←  overlay(upper=A_work, lower=A_plugin/usr/bin:/usr/bin_orig)
+#
+# This means unloading must be LIFO among hot-loaded plugins for a given dir.
+# We enforce LIFO globally (simpler, safe).
+#───────────────────────────────────────────────────────────────────────────────
+
+_overmount_plugin() {
+    local name="$1"
+    local plugin_mnt="$2"
+    local overmount_record="${PLUGIN_STATE}/overmounts/${name}"
+
+    : > "$overmount_record"   # truncate/create
+
+    local dir
+    for dir in $STD_DIRS; do
+        local src_dir="${plugin_mnt}/${dir}"
+        [ -d "$src_dir" ] || continue
+
+        # Skip empty directories
+        [ "$(ls -A "$src_dir" 2>/dev/null)" ] || continue
+
+        local abs_dir="/${dir}"
+        # Ensure the system directory exists before overmounting
+        mkdir -p "$abs_dir"
+
+        local safe_dir
+        safe_dir=$(_dirsafe "$dir")
+        local work_upper="${HOTLOAD_WORK}/${name}/${safe_dir}/upper"
+        local work_work="${HOTLOAD_WORK}/${name}/${safe_dir}/work"
+        mkdir -p "$work_upper" "$work_work"
+
+        mount -t overlay "overlay_${name}_${safe_dir}" \
+            -o "lowerdir=${src_dir}:${abs_dir},upperdir=${work_upper},workdir=${work_work}" \
+            "$abs_dir" 2>/dev/null \
+            || { warn "overmount failed for /$dir — skipping"; continue; }
+
+        printf '%s\n' "$abs_dir" >> "$overmount_record"
+        ok "overmounted /$dir"
+    done
+
+    # Check that at least one dir was mounted
+    [ -s "$overmount_record" ] || {
+        warn "plugin '$name' provided no standard directories to mount"
+        warn "it may only carry data, hooks, or modules"
+    }
+}
+
+_remove_overmounts() {
+    local name="$1"
+    local overmount_record="${PLUGIN_STATE}/overmounts/${name}"
+
+    [ -f "$overmount_record" ] || return 0
+
+    # Reverse order — last mounted must be first unmounted
+    local dirs
+    dirs=$(awk '{lines[NR]=$0} END {for(i=NR;i>=1;i--) print lines[i]}' \
+           "$overmount_record")
+
+    local any_busy=0
+    for dir in $dirs; do
+        # Check for processes using files in this directory
+        if fuser -s "$dir" 2>/dev/null; then
+            local procs
+            procs=$(fuser "$dir" 2>/dev/null || true)
+            warn "processes using $dir: $procs"
+            any_busy=$((any_busy + 1))
+        fi
+    done
+
+    if [ "$any_busy" -gt 0 ]; then
+        err "$any_busy director(y/ies) are busy — kill processes before unloading"
+        err "run: fuser -km $dir   (per dir above)"
+        return 1
+    fi
+
+    for dir in $dirs; do
+        umount "$dir" 2>/dev/null && ok "removed overmount: $dir" \
+            || warn "umount $dir failed — may already be gone"
+    done
+
+    rm -f "$overmount_record"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# ACTIVE LIST MANAGEMENT
+# Format: name|loopdev|mountpoint|source
+# source is either "boot" or "hot"
+#───────────────────────────────────────────────────────────────────────────────
+
+_active_list_add() {
+    local name="$1" loopdev="$2" mountpoint="$3" source="$4"
+    printf '%s|%s|%s|%s\n' "$name" "$loopdev" "$mountpoint" "$source" \
+        >> "${PLUGIN_STATE}/active.list"
+}
+
+_active_list_remove() {
+    local name="$1"
+    local tmp
+    tmp=$(mktemp "${PLUGIN_STATE}/.active.list.XXXXXX")
+    grep -v "^${name}|" "${PLUGIN_STATE}/active.list" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "${PLUGIN_STATE}/active.list"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# HOTLOAD ORDER TRACKING
+# /run/plugin-state/hotload-order — plugin names in load order, one per line
+#───────────────────────────────────────────────────────────────────────────────
+
+_hotload_order_push() {
+    printf '%s\n' "$1" >> "${PLUGIN_STATE}/hotload-order"
+}
+
+_hotload_order_top() {
+    tail -n1 "${PLUGIN_STATE}/hotload-order" 2>/dev/null
+}
+
+_hotload_order_pop() {
+    local name="$1"
+    local top
+    top=$(_hotload_order_top)
+    [ "$top" = "$name" ] \
+        || die "LIFO violation: '$name' is not the most recently loaded hot plugin (top: '${top}'). Unload '$top' first."
+    local tmp
+    tmp=$(mktemp "${PLUGIN_STATE}/.hotload-order.XXXXXX")
+    head -n -1 "${PLUGIN_STATE}/hotload-order" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "${PLUGIN_STATE}/hotload-order"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# RUN HOOKS
+#───────────────────────────────────────────────────────────────────────────────
+
+_run_hook() {
+    local hook_path="$1"
+    local hook_type="$2"
+    [ -f "$hook_path" ] && [ -x "$hook_path" ] || return 0
+    log "running $hook_type hook: $hook_path"
+    "$hook_path" && ok "$hook_type hook complete" \
+        || warn "$hook_type hook exited non-zero (continuing)"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: load
+# Hot-load a plugin from available/ into the live system
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_load() {
+    local name="${1%.sfs}"
+    [ -n "$name" ] || die "usage: plugin-ctl load <name>"
+
+    _is_active "$name" && die "'$name' is already active"
+
+    local sfs_path
+    sfs_path=$(_resolve_sfs "$name") \
+        || die "plugin '$name' not found in available/ or enabled/"
+
+    log "loading plugin: $name"
+    info "$sfs_path"
+
+    # Dep resolution (auto-loads missing deps recursively)
+    _resolve_and_load_deps "$sfs_path" || return 1
+
+    # Conflict check
+    _with_sfs_mount "$sfs_path" _check_conflicts_from_mount \
+        || die "conflict check failed — aborting load"
+
+    # Get a free loop device and do the permanent mount
+    local loop_dev
+    loop_dev=$(losetup -f 2>/dev/null) \
+        || die "no free loop devices"
+
+    local plugin_mnt="${PLUGIN_LOOPS}/${name}"
+    mkdir -p "$plugin_mnt"
+
+    losetup -r "$loop_dev" "$sfs_path" \
+        || die "losetup failed for $sfs_path"
+
+    mount -t squashfs -o ro "$loop_dev" "$plugin_mnt" \
+        || { losetup -d "$loop_dev"; die "squashfs mount failed"; }
+
+    # Load kernel modules if any
+    _load_plugin_modules "$plugin_mnt"
+
+    # Overmount standard directories
+    _overmount_plugin "$name" "$plugin_mnt"
+
+    # Run on_load hook (lives inside the plugin at /.plugin/on_load)
+    _run_hook "${plugin_mnt}/.plugin/on_load" "on_load"
+
+    # Register in active list + hotload order
+    _active_list_add "$name" "$loop_dev" "$plugin_mnt" "hot"
+    _hotload_order_push "$name"
+
+    ok "plugin '$name' loaded"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: unload
+# Hot-unload a plugin. LIFO enforced among hot-loaded plugins.
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_unload() {
+    local name="${1%.sfs}"
+    [ -n "$name" ] || die "usage: plugin-ctl unload <name>"
+
+    _is_active "$name" || die "'$name' is not currently active"
+    _is_hotloaded "$name" || die "'$name' was loaded at boot — cannot hot-unload (disable + reboot to remove)"
+
+    # LIFO enforcement
+    _hotload_order_pop "$name"
+
+    log "unloading plugin: $name"
+
+    local plugin_mnt
+    plugin_mnt=$(_get_mountpoint "$name")
+    local loop_dev
+    loop_dev=$(_get_loopdev "$name")
+
+    # Run on_unload hook before dismantling
+    _run_hook "${plugin_mnt}/.plugin/on_unload" "on_unload"
+
+    # Remove overmounts (checks for busy processes first)
+    _remove_overmounts "$name" || {
+        # Re-push since we didn't actually unload
+        _hotload_order_push "$name"
+        die "unload aborted — processes still using plugin files"
+    }
+
+    # Unload kernel modules
+    _unload_plugin_modules "$plugin_mnt"
+
+    # Dismount squashfs + release loop
+    umount "$plugin_mnt"   2>/dev/null || warn "squashfs umount failed"
+    losetup -d "$loop_dev" 2>/dev/null || warn "losetup -d failed"
+    rmdir  "$plugin_mnt"   2>/dev/null || true
+
+    # Clean up hotload workdirs
+    rm -rf "${HOTLOAD_WORK}/${name}" 2>/dev/null || true
+
+    # Remove from active list
+    _active_list_remove "$name"
+
+    ok "plugin '$name' unloaded"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: enable
+# Symlink plugin from available/ into enabled/ so it loads at next boot
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_enable() {
+    local name="${1%.sfs}"
+    [ -n "$name" ] || die "usage: plugin-ctl enable <name>"
+
+    local sfs_path="${PLUGINS_AVAILABLE}/${name}.sfs"
+    [ -f "$sfs_path" ] || die "'$name.sfs' not found in available/"
+
+    local link="${PLUGINS_ENABLED}/${name}.sfs"
+    [ -e "$link" ] && die "'$name' is already enabled"
+
+    # Boot device must be writable to add symlinks
+    mount -o remount,rw "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null \
+        || die "cannot remount $BOOT_MOUNT read-write"
+
+    mkdir -p "$PLUGINS_ENABLED"
+    ln -s "${sfs_path}" "${link}" \
+        || { mount -o remount,ro "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null; die "symlink failed"; }
+
+    mount -o remount,ro "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null || true
+
+    ok "'$name' enabled — will load at next boot"
+    [ "$(_is_active "$name")" ] || info "tip: 'plugin-ctl load $name' to activate now without rebooting"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: disable
+# Remove plugin from enabled/ — will not load at next boot
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_disable() {
+    local name="${1%.sfs}"
+    [ -n "$name" ] || die "usage: plugin-ctl disable <name>"
+
+    local link="${PLUGINS_ENABLED}/${name}.sfs"
+    [ -e "$link" ] || die "'$name' is not enabled"
+
+    mount -o remount,rw "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null \
+        || die "cannot remount $BOOT_MOUNT read-write"
+
+    rm -f "$link" \
+        || { mount -o remount,ro "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null; die "rm failed"; }
+
+    mount -o remount,ro "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null || true
+
+    ok "'$name' disabled — will not load at next boot"
+
+    if _is_hotloaded "$name"; then
+        warn "'$name' is currently hot-loaded. Run 'plugin-ctl unload $name' to remove from live system."
+    fi
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: list
+# Show plugins in various states
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    local filter="${1:-all}"
+
+    case "$filter" in
+        active|boot|available|all) ;;
+        *) die "unknown filter '$filter' — use: active boot available all" ;;
+    esac
+
+    if [ "$filter" = "active" ] || [ "$filter" = "all" ]; then
+        printf '\n%s Active Plugins%s\n' "$C_WHT" "$C_RST"
+        printf '%s─────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
+
+        if [ ! -s "${PLUGIN_STATE}/active.list" ]; then
+            printf '  %s(none)%s\n' "$C_DIM" "$C_RST"
+        else
+            printf '  %-20s %-10s %-6s %s\n' "NAME" "SOURCE" "LOOP" "MOUNTPOINT"
+            while IFS='|' read -r pname loopdev mountpoint source; do
+                [ -z "$pname" ] && continue
+                local tag
+                case "$source" in
+                    boot) tag="${C_BLU}boot${C_RST}" ;;
+                    hot)  tag="${C_GRN}hot ${C_RST}" ;;
+                    *)    tag="$source" ;;
+                esac
+                printf "  %-20s %-10b %-6s %s\n" "$pname" "$tag" "$loopdev" "$mountpoint"
+            done < "${PLUGIN_STATE}/active.list"
+        fi
+    fi
+
+    if [ "$filter" = "boot" ] || [ "$filter" = "all" ]; then
+        printf '\n%s Boot-Enabled Plugins%s\n' "$C_WHT" "$C_RST"
+        printf '%s─────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
+        local found=0
+        for sfs in "${PLUGINS_ENABLED}"/*.sfs; do
+            [ -f "$sfs" ] || continue
+            local bname
+            bname=$(basename "$sfs" .sfs)
+            printf '  %s\n' "$bname"
+            found=1
+        done
+        [ "$found" = "0" ] && printf '  %s(none)%s\n' "$C_DIM" "$C_RST"
+    fi
+
+    if [ "$filter" = "available" ] || [ "$filter" = "all" ]; then
+        printf '\n%s Available Plugins%s\n' "$C_WHT" "$C_RST"
+        printf '%s─────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
+        local found=0
+        for sfs in "${PLUGINS_AVAILABLE}"/*.sfs; do
+            [ -f "$sfs" ] || continue
+            local bname
+            bname=$(basename "$sfs" .sfs)
+            local active_tag=""
+            _is_active "$bname" && active_tag=" ${C_GRN}[active]${C_RST}"
+            _is_active "$bname" || {
+                [ -e "${PLUGINS_ENABLED}/${bname}.sfs" ] && active_tag=" ${C_BLU}[enabled]${C_RST}"
+            }
+            printf "  %-24s%b\n" "$bname" "$active_tag"
+            found=1
+        done
+        [ "$found" = "0" ] && printf '  %s(none)%s\n' "$C_DIM" "$C_RST"
+    fi
+
+    printf '\n'
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: info
+# Print manifest details for any plugin (active, available, or by path)
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_info() {
+    local name="${1%.sfs}"
+    [ -n "$name" ] || die "usage: plugin-ctl info <name>"
+
+    local sfs_path
+    # Check if it's already mounted (active)
+    if _is_active "$name"; then
+        local plugin_mnt
+        plugin_mnt=$(_get_mountpoint "$name")
+        printf '\n%s Plugin: %s%s\n' "$C_WHT" "$name" "$C_RST"
+        printf '%s─────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
+        _print_manifest "$plugin_mnt"
+        printf '  %-16s %s\n' "Status:" "${C_GRN}active${C_RST}"
+        printf '  %-16s %s\n' "Loop Dev:" "$(_get_loopdev "$name")"
+        printf '  %-16s %s\n' "Mountpoint:" "$(_get_mountpoint "$name")"
+    else
+        sfs_path=$(_resolve_sfs "$name") \
+            || die "plugin '$name' not found"
+        printf '\n%s Plugin: %s%s\n' "$C_WHT" "$name" "$C_RST"
+        printf '%s─────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
+        _with_sfs_mount "$sfs_path" _print_manifest
+        printf '  %-16s %s\n' "Status:" "${C_DIM}not active${C_RST}"
+        printf '  %-16s %s\n' "Path:" "$sfs_path"
+    fi
+    printf '\n'
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: check
+# Dep/conflict check without loading
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_check() {
+    local name="${1%.sfs}"
+    [ -n "$name" ] || die "usage: plugin-ctl check <name>"
+
+    local sfs_path
+    sfs_path=$(_resolve_sfs "$name") \
+        || die "plugin '$name' not found"
+
+    log "checking plugin: $name"
+    printf '\n'
+
+    local dep_issues conflict_issues
+
+    dep_issues=$(_with_sfs_mount "$sfs_path" _check_deps_from_mount 2>&1); local dep_ret=$?
+    conflict_issues=$(_with_sfs_mount "$sfs_path" _check_conflicts_from_mount 2>&1); local con_ret=$?
+
+    printf '%s' "$dep_issues"
+    printf '%s' "$conflict_issues"
+
+    printf '\n'
+    if [ "$dep_ret" = "0" ] && [ "$con_ret" = "0" ]; then
+        ok "all checks passed — '$name' is ready to load"
+    else
+        fail "checks failed — resolve issues above before loading"
+        return 1
+    fi
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: verify
+# squashfs integrity check — unsquashfs -check-data equivalent
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_verify() {
+    local name="${1%.sfs}"
+    [ -n "$name" ] || die "usage: plugin-ctl verify <name|path>"
+
+    local sfs_path
+    if [ -f "$name" ] || [ -f "${name}.sfs" ]; then
+        sfs_path="${name}"
+        [ -f "$sfs_path" ] || sfs_path="${name}.sfs"
+    else
+        sfs_path=$(_resolve_sfs "$name") \
+            || die "plugin '$name' not found"
+    fi
+
+    log "verifying: $(basename "$sfs_path")"
+
+    # unsquashfs -check-data reads and checksums every block
+    if unsquashfs -check-data "$sfs_path" >/dev/null 2>&1; then
+        ok "integrity check passed: $sfs_path"
+    else
+        fail "integrity check FAILED: $sfs_path"
+        return 1
+    fi
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: build
+# Pack a staged directory into a .sfs plugin
+#
+# Expected structure of <stagedir>:
+#   .plugin/
+#     manifest     ← required (NAME, VERSION at minimum)
+#     on_load      ← optional executable
+#     on_unload    ← optional executable
+#     modules      ← optional, newline-separated module names
+#   usr/bin/...
+#   usr/lib/...
+#   etc/...
+#   ...
+#───────────────────────────────────────────────────────────────────────────────
+
+_build_validate_manifest() {
+    local mnt="$1"   # here mnt IS the stagedir, not a squashfs mount
+    local manifest="${mnt}/.plugin/manifest"
+
+    [ -f "$manifest" ] || {
+        fail ".plugin/manifest not found in $mnt"
+        info "Create it with at minimum:"
+        printf '    NAME="%s"\n'    "$(basename "$mnt")"
+        printf '    VERSION="1.0"\n'
+        printf '    LOAD_ORDER=50\n'
+        return 1
+    }
+
+    local name version
+    name=$(
+        unset NAME
+        # shellcheck disable=SC1090
+        . "$manifest" 2>/dev/null
+        printf '%s' "${NAME:-}"
+    )
+    version=$(
+        unset VERSION
+        # shellcheck disable=SC1090
+        . "$manifest" 2>/dev/null
+        printf '%s' "${VERSION:-}"
+    )
+
+    [ -n "$name" ]    || { fail "manifest missing NAME";    return 1; }
+    [ -n "$version" ] || { fail "manifest missing VERSION"; return 1; }
+
+    # Validate no spaces in NAME (would break active.list parsing)
+    case "$name" in
+        *" "*|*"|"*) fail "NAME must not contain spaces or pipe characters"; return 1 ;;
+    esac
+
+    ok "manifest valid: $name $version"
+}
+
+cmd_build() {
+    local stagedir="$1"
+    local outname="${2%.sfs}"
+    local version="${3:-}"
+
+    [ -n "$stagedir" ] && [ -n "$outname" ] \
+        || die "usage: plugin-ctl build <stagedir> <name> [version]"
+
+    [ -d "$stagedir" ] || die "stage directory not found: $stagedir"
+
+    command -v mksquashfs >/dev/null 2>&1 \
+        || die "mksquashfs not found — install squashfs-tools plugin or provide it in base.sfs"
+
+    log "building plugin: $outname"
+
+    # Validate manifest
+    _build_validate_manifest "$stagedir" || die "fix manifest before building"
+
+    # Optionally patch VERSION from arg
+    if [ -n "$version" ]; then
+        local manifest="${stagedir}/.plugin/manifest"
+        # Portable in-place sed (busybox style)
+        sed -i "s/^VERSION=.*/VERSION=\"${version}\"/" "$manifest" \
+            && ok "VERSION set to $version"
+    fi
+
+    local out_sfs="${PLUGINS_AVAILABLE}/${outname}.sfs"
+
+    # Ensure available/ dir exists (boot device must be writable)
+    mount -o remount,rw "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null \
+        || die "cannot remount $BOOT_MOUNT read-write for output"
+
+    mkdir -p "$PLUGINS_AVAILABLE"
+
+    # mksquashfs flags:
+    #   -comp xz       best compression ratio for storage
+    #   -Xbcj x86      x86 branch/call/jump filter (helps binary compression)
+    #   -noappend      overwrite if exists
+    #   -no-progress   cleaner output in scripts
+    #   -no-exports    we never NFS-export squashfs
+    mksquashfs "$stagedir" "$out_sfs" \
+        -comp xz -Xbcj x86 \
+        -noappend \
+        -no-exports \
+        2>&1 | while IFS= read -r line; do info "$line"; done
+
+    mount -o remount,ro "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null || true
+
+    [ -f "$out_sfs" ] || die "mksquashfs produced no output"
+
+    local size
+    size=$(du -sh "$out_sfs" 2>/dev/null | cut -f1)
+    ok "built: $out_sfs ($size)"
+    info "run 'plugin-ctl enable $outname' to activate at next boot"
+    info "run 'plugin-ctl load $outname' to activate now"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# COMMAND: reload
+# Convenience: unload then load. Useful during plugin development.
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_reload() {
+    local name="${1%.sfs}"
+    [ -n "$name" ] || die "usage: plugin-ctl reload <name>"
+
+    _is_hotloaded "$name" || die "'$name' was not hot-loaded — cannot reload (reboot required)"
+
+    log "reloading: $name"
+    cmd_unload "$name" && cmd_load "$name"
+    ok "reload complete"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# USAGE
+#───────────────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+
+${C_WHT}plugin-ctl${C_RST} — FrugalOS Plugin Manager
+
+${C_YEL}Usage:${C_RST}
+  plugin-ctl <command> [args]
+
+${C_YEL}Commands:${C_RST}
+  ${C_GRN}list${C_RST}    [active|boot|available|all]  list plugins (default: all)
+  ${C_GRN}info${C_RST}    <name>                       show plugin manifest + status
+  ${C_GRN}load${C_RST}    <name>                       hot-load from available/
+  ${C_GRN}unload${C_RST}  <name>                       hot-unload (LIFO order)
+  ${C_GRN}enable${C_RST}  <name>                       mark for boot autoload
+  ${C_GRN}disable${C_RST} <name>                       remove from boot autoload
+  ${C_GRN}check${C_RST}   <name>                       dep/conflict check (no load)
+  ${C_GRN}build${C_RST}   <stagedir> <name> [ver]      pack directory → .sfs plugin
+  ${C_GRN}verify${C_RST}  <name|path>                  squashfs integrity check
+  ${C_GRN}reload${C_RST}  <name>                       unload + load (dev cycle)
+
+${C_YEL}Notes:${C_RST}
+  Hot-unload is LIFO: you must unload plugins in reverse load order.
+  Boot-loaded plugins require a reboot to remove (disable + reboot).
+  build output goes to: ${PLUGINS_AVAILABLE}/
+  All mount operations require root.
+
+EOF
+    exit 1
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+#───────────────────────────────────────────────────────────────────────────────
+
+[ $# -gt 0 ] || usage
+
+_load_env
+
+CMD="$1"; shift
+
+# Commands that don't mutate state don't need root
+case "$CMD" in
+    list|info|check|verify) ;;
+    *) _require_root ;;
+esac
+
+case "$CMD" in
+    list)    cmd_list    "$@" ;;
+    info)    cmd_info    "$@" ;;
+    load)    cmd_load    "$@" ;;
+    unload)  cmd_unload  "$@" ;;
+    enable)  cmd_enable  "$@" ;;
+    disable) cmd_disable "$@" ;;
+    check)   cmd_check   "$@" ;;
+    build)   cmd_build   "$@" ;;
+    verify)  cmd_verify  "$@" ;;
+    reload)  cmd_reload  "$@" ;;
+    help|--help|-h) usage ;;
+    *) err "unknown command: '$CMD'"; usage ;;
+esac

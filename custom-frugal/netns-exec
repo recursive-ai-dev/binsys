@@ -1,0 +1,517 @@
+#!/bin/sh
+#═══════════════════════════════════════════════════════════════════════════════
+#  /usr/bin/netns-exec — FrugalOS Per-Process Network Namespace Isolation
+#
+#  Runs a command inside a network namespace, isolating it from the host
+#  network stack. The isolated process cannot see host interfaces, routes,
+#  iptables/nftables rules, or other processes' sockets.
+#
+#  Modes:
+#    isolate    — completely empty namespace, no network at all (not even lo)
+#    loopback   — loopback only (127.0.0.1 works, no external connectivity)
+#    jail       — loopback + veth pair to a private bridge (controlled egress)
+#    host       — host network namespace (passthrough, no isolation)
+#    create     — create a persistent named namespace
+#    enter      — enter a persistent named namespace
+#    destroy    — destroy a persistent named namespace
+#    list       — list active namespaces
+#
+#  Requirements:
+#    busybox unshare  — for isolate/loopback modes (always available)
+#    ip (iproute2)    — for jail mode + named namespaces
+#                       install via: plugin-from-apk iproute2
+#
+#  Usage:
+#    netns-exec isolate  <cmd> [args]   no network whatsoever
+#    netns-exec loopback <cmd> [args]   127.0.0.1 works, nothing external
+#    netns-exec jail     <cmd> [args]   veth + private bridge
+#    netns-exec host     <cmd> [args]   full host network (no isolation)
+#    netns-exec create   <name>         create persistent named netns
+#    netns-exec enter    <name> <cmd>   run cmd in named netns
+#    netns-exec destroy  <name>         destroy named netns
+#    netns-exec list                    list named netns
+#
+#  Plugin manifest integration:
+#    Add NET_POLICY="isolate|loopback|jail|host" to .plugin/manifest
+#    plugin-ctl reads this and wraps the plugin's on_load hook accordingly.
+#
+#  Named namespace persistence:
+#    Created namespaces are bind-mounted at /run/netns/<name>
+#    They survive as long as at least one process or bind-mount references them.
+#    'netns-exec destroy' removes the bind-mount; the netns disappears when
+#    all processes inside it exit.
+#═══════════════════════════════════════════════════════════════════════════════
+
+set -e
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export PATH
+
+#───────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+#───────────────────────────────────────────────────────────────────────────────
+
+NETNS_DIR="/run/netns"
+NETNS_BRIDGE_PREFIX="frgnsbr"    # bridge interface prefix for jail mode
+NETNS_VETH_HOST_PREFIX="frgvh"   # veth host-side prefix
+NETNS_VETH_NS_PREFIX="frgvn"     # veth namespace-side prefix
+NETNS_SUBNET="10.99"             # jail bridge subnet: 10.99.<ns_id>.0/30
+
+#───────────────────────────────────────────────────────────────────────────────
+# COLOUR + LOGGING
+#───────────────────────────────────────────────────────────────────────────────
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+    C_GRN='\033[1;32m'; C_YEL='\033[1;33m'; C_BLU='\033[1;34m'
+    C_RED='\033[1;31m'; C_WHT='\033[1;37m'; C_DIM='\033[0;37m'; C_RST='\033[0m'
+else
+    C_GRN=''; C_YEL=''; C_BLU=''; C_RED=''; C_WHT=''; C_DIM=''; C_RST=''
+fi
+
+log()  { printf "${C_GRN}=>${C_RST} %s\n" "$*"; }
+info() { printf "   %s\n" "$*"; }
+warn() { printf "${C_YEL}  warn:${C_RST} %s\n" "$*" >&2; }
+die()  { printf "${C_RED}  error:${C_RST} %s\n" "$*" >&2; exit 1; }
+ok()   { printf "${C_GRN}  ✓${C_RST} %s\n" "$*"; }
+
+#───────────────────────────────────────────────────────────────────────────────
+# TOOL DETECTION
+#───────────────────────────────────────────────────────────────────────────────
+
+_has_unshare() { command -v unshare >/dev/null 2>&1; }
+_has_ip()      { command -v ip >/dev/null 2>&1 && ip netns help >/dev/null 2>&1; }
+_has_nsenter() { command -v nsenter >/dev/null 2>&1; }
+_has_ifconfig(){ command -v ifconfig >/dev/null 2>&1; }
+
+_require_unshare() {
+    _has_unshare || die "unshare not found — is busybox complete? (need CONFIG_UNSHARE)"
+}
+
+_require_ip() {
+    _has_ip || die "iproute2 'ip' with netns support required for this mode. Install via: plugin-from-apk iproute2"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# LOOPBACK SETUP HELPER
+# Must run INSIDE the new network namespace.
+# Used by both loopback and jail modes.
+#───────────────────────────────────────────────────────────────────────────────
+
+# This function writes a small setup script that runs inside the new netns
+# (via exec in the unshare child) to bring up loopback before exec'ing the
+# user's command. We can't call a shell function across the fork boundary
+# cleanly in POSIX sh, so we write it to a tmpfile.
+_write_lo_setup() {
+    local tmpfile
+    tmpfile=$(mktemp /tmp/netns-lo-XXXXXX.sh)
+    cat > "$tmpfile" <<'LOSETUP'
+#!/bin/sh
+# Bring up loopback inside the new netns
+if command -v ip >/dev/null 2>&1; then
+    ip link set lo up 2>/dev/null || true
+    ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+    ip -6 addr add ::1/128 dev lo 2>/dev/null || true
+elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null || true
+fi
+LOSETUP
+    chmod 755 "$tmpfile"
+    printf '%s' "$tmpfile"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# MODE: isolate
+# Completely empty network namespace — no interfaces, no lo, no sockets.
+# A process here cannot initiate or receive ANY network connection.
+# Even 127.0.0.1 is unavailable (lo doesn't exist in the namespace).
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_isolate() {
+    [ $# -ge 1 ] || die "usage: netns-exec isolate <command> [args]"
+    _require_unshare
+
+    log "executing in ISOLATED namespace (no network): $*"
+    info "no interfaces — no loopback — no sockets"
+
+    exec unshare --net -- "$@"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# MODE: loopback
+# Network namespace with loopback only.
+# The process can bind to 127.0.0.1 and communicate with itself,
+# but cannot reach any external host or the host network stack.
+# Unix sockets are unaffected (they don't use the network namespace).
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_loopback() {
+    [ $# -ge 1 ] || die "usage: netns-exec loopback <command> [args]"
+    _require_unshare
+
+    log "executing in LOOPBACK-ONLY namespace: $*"
+    info "127.0.0.1 works — no external connectivity"
+
+    local lo_setup
+    lo_setup=$(_write_lo_setup)
+
+    # The trap ensures we clean up the tmp setup script even if exec fails
+    trap "rm -f '$lo_setup'" EXIT INT TERM
+
+    exec unshare --net -- /bin/sh -c "
+        . '${lo_setup}'
+        rm -f '${lo_setup}'
+        exec \"\$@\"
+    " -- "$@"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# MODE: jail
+# Network namespace with:
+#   - loopback (127.0.0.1)
+#   - veth pair to a per-jail bridge on the host
+#   - the bridge has NO uplink to the host's external interfaces
+#   - can be given controlled internet access by adding a masquerade rule
+#
+# Topology:
+#   host: [frgnsbr0] ←→ [frgvh0] ←→ [frgvn0 inside jail netns]
+#                         veth pair
+#   bridge IP: 10.99.0.1/30
+#   jail IP:   10.99.0.2/30
+#
+# To add controlled outbound (in on_load of a trusted plugin):
+#   nft add rule inet frugalos_nat postrouting \
+#       iifname "frgnsbr0" oifname "eth0" masquerade
+#───────────────────────────────────────────────────────────────────────────────
+
+# Counter file for unique bridge/veth IDs per jail
+JAIL_COUNTER_FILE="${NETNS_DIR}/jail-counter"
+
+_next_jail_id() {
+    _init_counter() { mkdir -p "$NETNS_DIR"; echo "0" > "$JAIL_COUNTER_FILE"; }
+    [ -f "$JAIL_COUNTER_FILE" ] || _init_counter
+    local id
+    id=$(cat "$JAIL_COUNTER_FILE")
+    id=$((id + 1))
+    [ "$id" -gt 255 ] && { echo "0" > "$JAIL_COUNTER_FILE"; id=1; }
+    echo "$id" > "$JAIL_COUNTER_FILE"
+    printf '%d' "$id"
+}
+
+cmd_jail() {
+    [ $# -ge 1 ] || die "usage: netns-exec jail <command> [args]"
+    _require_ip
+
+    local jail_id
+    jail_id=$(_next_jail_id)
+
+    local br="${NETNS_BRIDGE_PREFIX}${jail_id}"
+    local veth_host="${NETNS_VETH_HOST_PREFIX}${jail_id}"
+    local veth_ns="${NETNS_VETH_NS_PREFIX}${jail_id}"
+    local subnet="${NETNS_SUBNET}.${jail_id}"
+    local host_ip="${subnet}.1"
+    local jail_ip="${subnet}.2"
+    local netmask="30"
+
+    log "creating jail namespace (id=${jail_id})"
+    info "bridge: ${br} @ ${host_ip}/${netmask}"
+    info "jail:   ${veth_ns} @ ${jail_ip}/${netmask}"
+
+    # Create bridge on host
+    ip link add "$br" type bridge 2>/dev/null \
+        || die "could not create bridge $br"
+    ip addr add "${host_ip}/${netmask}" dev "$br"
+    ip link set "$br" up
+
+    # Create veth pair
+    ip link add "$veth_host" type veth peer name "$veth_ns" 2>/dev/null \
+        || { ip link delete "$br" 2>/dev/null; die "could not create veth pair"; }
+
+    # Attach host-side veth to bridge
+    ip link set "$veth_host" master "$br"
+    ip link set "$veth_host" up
+
+    # The cleanup function removes host-side resources after child exits
+    _jail_cleanup() {
+        ip link delete "$veth_host" 2>/dev/null || true
+        ip link delete "$br"        2>/dev/null || true
+    }
+    trap '_jail_cleanup' EXIT INT TERM
+
+    local lo_setup
+    lo_setup=$(_write_lo_setup)
+
+    # Launch in new netns, move veth_ns into it, configure it
+    # unshare --net forks into the new netns.
+    # We need to:
+    #   1. Get the PID of the unshared child
+    #   2. Move veth_ns into it (ip link set netns <pid>)
+    #   3. Configure the veth inside the netns
+    #   4. Then exec the user's command
+
+    # We use a FIFO to synchronise with the child
+    local fifo
+    fifo=$(mktemp -u /tmp/netns-fifo-XXXXXX)
+    mkfifo "$fifo"
+
+    (
+        # Child: run in new netns
+        unshare --net /bin/sh -c "
+            # Signal parent with our PID
+            echo \$\$ > '${fifo}'
+
+            # Wait for parent to move veth into us
+            read -r _ready < '${fifo}'
+
+            # Set up loopback
+            . '${lo_setup}'
+            rm -f '${lo_setup}'
+
+            # Configure veth
+            ip link set '${veth_ns}' up
+            ip addr add '${jail_ip}/${netmask}' dev '${veth_ns}'
+            ip route add default via '${host_ip}'
+
+            # Signal parent setup is complete
+            echo ready > '${fifo}'
+
+            # Exec user command
+            exec \"\$@\"
+        " -- "$@"
+    ) &
+    local child_pid=$!
+
+    # Read child's inner PID (the unshare child, not the subshell)
+    local inner_pid
+    inner_pid=$(read -r p < "$fifo"; printf '%s' "$p")
+
+    # Move veth_ns into the child's netns
+    ip link set "$veth_ns" netns "$inner_pid" 2>/dev/null \
+        || { echo fail > "$fifo"; wait "$child_pid"; rm -f "$fifo"; die "could not move veth into netns"; }
+
+    # Signal child to continue
+    echo go > "$fifo"
+
+    # Wait for child to finish setup
+    read -r _ready < "$fifo"
+    rm -f "$fifo"
+
+    ok "jail namespace ready — waiting for process to exit"
+    wait "$child_pid"
+    local exit_code=$?
+    _jail_cleanup
+    trap - EXIT INT TERM
+    return $exit_code
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# MODE: host
+# Passthrough — runs the command in the host's network namespace.
+# Equivalent to just running the command directly.
+# Included for symmetry and for use in plugin manifests where NET_POLICY
+# might be set dynamically.
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_host() {
+    [ $# -ge 1 ] || die "usage: netns-exec host <command> [args]"
+    warn "host mode: no network isolation applied"
+    exec "$@"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# NAMED NAMESPACE MANAGEMENT
+# Named namespaces are persistent: they survive process exit if bind-mounted.
+# Requires iproute2's ip netns subsystem (or our manual equivalent).
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_create() {
+    local name="$1"
+    [ -n "$name" ] || die "usage: netns-exec create <name>"
+    _validate_nsname "$name"
+
+    if _has_ip; then
+        # iproute2 path — clean and standard
+        ip netns add "$name" 2>/dev/null \
+            || die "namespace '$name' already exists or ip netns failed"
+        ok "created named namespace: $name"
+        info "enter with: netns-exec enter $name <command>"
+        return 0
+    fi
+
+    # Manual path — bind-mount /proc/self/ns/net for a background holder process
+    mkdir -p "$NETNS_DIR"
+    local ns_file="${NETNS_DIR}/${name}"
+    [ -e "$ns_file" ] && die "namespace '$name' already exists at $ns_file"
+
+    # Create the mount point
+    : > "$ns_file"
+
+    # Use unshare to create a new netns, then bind-mount its netns fd
+    # The background process keeps the namespace alive
+    local pid_file="${NETNS_DIR}/ns-holder-${name}.pid"
+
+    unshare --net /bin/sh -c "
+        mount --bind /proc/self/ns/net '${ns_file}'
+        echo \$\$ > '${pid_file}'
+        # Sleep forever — this process keeps the netns alive
+        exec sleep infinity
+    " &
+
+    sleep 0.1  # give unshare time to bind-mount
+    [ -f "$pid_file" ] || die "namespace holder process failed to start"
+
+    ok "created named namespace: $name (holder PID: $(cat "$pid_file"))"
+    info "enter with: netns-exec enter $name <command>"
+    info "destroy with: netns-exec destroy $name"
+}
+
+cmd_enter() {
+    local name="$1"; shift
+    [ -n "$name" ] && [ $# -ge 1 ] \
+        || die "usage: netns-exec enter <name> <command> [args]"
+    _validate_nsname "$name"
+
+    if _has_ip; then
+        ip netns exec "$name" "$@"
+        return $?
+    fi
+
+    local ns_file="${NETNS_DIR}/${name}"
+    [ -e "$ns_file" ] || die "namespace '$name' not found at $ns_file"
+
+    _has_nsenter || die "nsenter not found — install iproute2 plugin for named namespace support"
+    exec nsenter --net="$ns_file" -- "$@"
+}
+
+cmd_destroy() {
+    local name="$1"
+    [ -n "$name" ] || die "usage: netns-exec destroy <name>"
+    _validate_nsname "$name"
+
+    if _has_ip; then
+        ip netns delete "$name" 2>/dev/null \
+            || die "could not delete namespace '$name'"
+        ok "destroyed: $name"
+        return 0
+    fi
+
+    local ns_file="${NETNS_DIR}/${name}"
+    [ -e "$ns_file" ] || die "namespace '$name' not found"
+
+    # Kill the holder process if we started one
+    local pid_file="${NETNS_DIR}/ns-holder-${name}.pid"
+    if [ -f "$pid_file" ]; then
+        local holder_pid
+        holder_pid=$(cat "$pid_file")
+        kill "$holder_pid" 2>/dev/null || true
+        rm -f "$pid_file"
+    fi
+
+    umount "$ns_file" 2>/dev/null || true
+    rm -f "$ns_file"
+    ok "destroyed: $name"
+}
+
+cmd_list() {
+    if _has_ip; then
+        printf '\n  Named network namespaces:\n\n'
+        local count=0
+        ip netns list 2>/dev/null | while read -r line; do
+            printf '  %s\n' "$line"
+            count=$((count + 1))
+        done || true
+        printf '\n'
+        return
+    fi
+
+    mkdir -p "$NETNS_DIR"
+    printf '\n  Named network namespaces (%s):\n\n' "$NETNS_DIR"
+    local count=0
+    for ns in "${NETNS_DIR}"/*; do
+        [ -e "$ns" ] || continue
+        local nsname
+        nsname=$(basename "$ns")
+        printf '  %s\n' "$nsname"
+        count=$((count + 1))
+    done
+    [ "$count" = "0" ] && printf '  %s(none)%s\n' "$C_DIM" "$C_RST"
+    printf '\n'
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# VALIDATION
+#───────────────────────────────────────────────────────────────────────────────
+
+_validate_nsname() {
+    local name="$1"
+    case "$name" in
+        ''|*[!a-zA-Z0-9_-]*) die "invalid namespace name '$name' (alphanumeric, hyphen, underscore only)" ;;
+        -*)                   die "namespace name cannot start with hyphen" ;;
+    esac
+    [ "${#name}" -le 32 ] || die "namespace name too long (max 32 chars)"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# USAGE
+#───────────────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+
+${C_WHT}netns-exec${C_RST} — FrugalOS Per-Process Network Namespace Isolation
+
+${C_YEL}Isolation modes:${C_RST}
+  netns-exec isolate  <cmd>         no network at all (not even loopback)
+  netns-exec loopback <cmd>         127.0.0.1 only, no external access
+  netns-exec jail     <cmd>         private bridge, controlled egress
+  netns-exec host     <cmd>         host network (no isolation)
+
+${C_YEL}Named namespace management:${C_RST}
+  netns-exec create  <name>         create persistent named namespace
+  netns-exec enter   <name> <cmd>   run command in named namespace
+  netns-exec destroy <name>         destroy named namespace
+  netns-exec list                   list all named namespaces
+
+${C_YEL}Requirements:${C_RST}
+  isolate / loopback   busybox unshare (always available)
+  jail / named ns      iproute2 plugin (plugin-from-apk iproute2)
+
+${C_YEL}Integration with plugin manifests:${C_RST}
+  Add to .plugin/manifest:
+    NET_POLICY="isolate"    completely isolated
+    NET_POLICY="loopback"   loopback only
+    NET_POLICY="jail"       private bridge
+    NET_POLICY="host"       full host network
+
+  plugin-ctl reads NET_POLICY and wraps the plugin's execution accordingly.
+
+${C_YEL}Examples:${C_RST}
+  netns-exec isolate  /usr/bin/untrusted-binary --arg
+  netns-exec loopback python3 server.py
+  netns-exec jail     curl https://example.com
+  netns-exec create   sandbox
+  netns-exec enter    sandbox /bin/sh
+  netns-exec destroy  sandbox
+
+EOF
+    exit 1
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+#───────────────────────────────────────────────────────────────────────────────
+
+[ $# -ge 1 ] || usage
+
+CMD="$1"; shift
+
+case "$CMD" in
+    isolate)  cmd_isolate  "$@" ;;
+    loopback) cmd_loopback "$@" ;;
+    jail)     cmd_jail     "$@" ;;
+    host)     cmd_host     "$@" ;;
+    create)   cmd_create   "$@" ;;
+    enter)    cmd_enter    "$@" ;;
+    destroy)  cmd_destroy  "$@" ;;
+    list)     cmd_list          ;;
+    help|--help|-h) usage       ;;
+    *) die "unknown mode: '$CMD' — run 'netns-exec --help'" ;;
+esac

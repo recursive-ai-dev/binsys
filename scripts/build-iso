@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# binsys build-iso — interactive ISO creator
+# Creates ISO9660 images from existing systems or directories.
+# Optionally makes them bootable (El-Torito).
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+
+require_binsys
+
+header "Build ISO Image"
+echo " Create an ISO9660 image from a binsys system or a directory."
+
+# ── step 1: source ────────────────────────────────────────────────────────────
+src_type=$(select_one "Source type" \
+    "existing binsys system" \
+    "directory on disk")
+
+case "$src_type" in
+    "existing binsys system")
+        echo ""
+        echo " Available systems:"
+        list_systems
+        echo ""
+        system_name=$(prompt "System name" "")
+        binsys info "$system_name" &>/dev/null || die "System '$system_name' not found"
+        source_arg="$system_name"
+        ;;
+    "directory on disk")
+        dir=$(prompt "Directory path" "$(pwd)")
+        [[ -d "$dir" ]] || die "Not a directory: $dir"
+        source_arg="$dir"
+        ;;
+esac
+
+# ── step 2: output ────────────────────────────────────────────────────────────
+default_out="${system_name:-$(basename "$dir")}.iso"
+output=$(prompt "Output ISO path" "$default_out")
+
+# ── step 3: bootable? ─────────────────────────────────────────────────────────
+bootable=""
+if confirm "Make it a bootable ISO (El-Torito)?" "n"; then
+    bootable="--bootable"
+fi
+
+# ── step 4: review ─────────────────────────────────────────────────────────────
+header "Review"
+echo "  Source:  $source_arg"
+echo "  Output:  $output"
+echo "  Bootable: ${bootable:-no}"
+echo ""
+
+if ! confirm "Create the ISO?" "Y"; then
+    die "Cancelled."
+fi
+
+# ── step 5: build ──────────────────────────────────────────────────────────────
+header "Creating ISO"
+
+if [[ "$src_type" == "existing binsys system" ]]; then
+    if [[ -n "$bootable" ]]; then
+        warn "Bootable ISO from a system requires kernel+initrd inside."
+        warn "Continuing with bootable flag..."
+    fi
+    run_with_spinner "Building ISO from system..." \
+        binsys iso "$source_arg" --output "$output" $bootable
+else
+    run_with_spinner "Building ISO from directory..." \
+        binsys iso "$source_arg" --output "$output" --name "${system_name:-$(basename "$dir")}" $bootable
+fi
+
+if [[ -f "$output" ]]; then
+    sz=$(stat -c%s "$output" 2>/dev/null | numfmt --to=iec 2>/dev/null || ls -lh "$output" | awk '{print $5}')
+    ok "ISO created: ${output}  (${sz})"
+    sub "Mount with:  mount -o loop ${output} /mnt"
+    sub "Burn with:   dd if=${output} of=/dev/sdX bs=4M status=progress"
+else
+    die "ISO creation failed — output not found: $output"
+fi
+
+done_msg

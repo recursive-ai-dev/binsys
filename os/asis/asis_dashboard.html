@@ -1,0 +1,1481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ASIS — Algebraic Swarm Intelligence System | Live Dashboard</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Inter:wght@300;400;600;800&display=swap');
+
+:root {
+  --bg-primary: #050508;
+  --bg-secondary: #0a0a12;
+  --bg-panel: rgba(10, 10, 20, 0.85);
+  --border-glow: rgba(0, 255, 255, 0.15);
+  --cyan: #00f0ff;
+  --magenta: #ff00aa;
+  --purple: #b829dd;
+  --green: #00ff88;
+  --gold: #ffd700;
+  --orange: #ff8800;
+  --text-primary: #e0e0e0;
+  --text-secondary: #8888a0;
+  --glass: rgba(255, 255, 255, 0.03);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', sans-serif;
+  overflow: hidden;
+  width: 100vw;
+  height: 100vh;
+}
+
+#canvas-container {
+  position: fixed;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  z-index: 1;
+}
+
+#bg-canvas {
+  position: absolute;
+  top: 0; left: 0;
+}
+
+#main-canvas {
+  position: absolute;
+  top: 0; left: 0;
+}
+
+/* UI Overlay */
+.ui-layer {
+  position: fixed;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.ui-layer > * { pointer-events: auto; }
+
+/* Header */
+.header {
+  top: 0; left: 0; right: 0;
+  padding: 20px 30px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: linear-gradient(180deg, rgba(5,5,8,0.9) 0%, rgba(5,5,8,0) 100%);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand-icon {
+  width: 40px; height: 40px;
+  border: 2px solid var(--cyan);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  font-size: 18px;
+  color: var(--cyan);
+  box-shadow: 0 0 20px rgba(0, 240, 255, 0.3);
+  animation: pulse-glow 3s ease-in-out infinite;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 20px rgba(0, 240, 255, 0.3); }
+  50% { box-shadow: 0 0 40px rgba(0, 240, 255, 0.6); }
+}
+
+.brand-text h1 {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--text-primary);
+}
+
+.brand-text span {
+  font-size: 11px;
+  color: var(--text-secondary);
+  letter-spacing: 3px;
+  text-transform: uppercase;
+}
+
+.status-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  background: var(--glass);
+  border: 1px solid var(--border-glow);
+  border-radius: 20px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+.status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 10px var(--green);
+  animation: blink 2s ease-in-out infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* Side Panels */
+.panel {
+  background: var(--bg-panel);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--border-glow);
+  border-radius: 12px;
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.panel:hover {
+  border-color: rgba(0, 240, 255, 0.3);
+  box-shadow: 0 0 30px rgba(0, 240, 255, 0.05);
+}
+
+.panel-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-glow);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  color: var(--cyan);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.panel-body {
+  padding: 12px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.panel-body::-webkit-scrollbar { width: 4px; }
+.panel-body::-webkit-scrollbar-track { background: transparent; }
+.panel-body::-webkit-scrollbar-thumb { background: var(--border-glow); border-radius: 2px; }
+
+.left-panel {
+  left: 20px;
+  top: 80px;
+  width: 320px;
+}
+
+.right-panel {
+  right: 20px;
+  top: 80px;
+  width: 320px;
+}
+
+.bottom-panel {
+  left: 20px;
+  right: 20px;
+  bottom: 20px;
+  height: 200px;
+  display: flex;
+  gap: 16px;
+}
+
+.bottom-panel .panel { flex: 1; }
+
+/* Agent List */
+.agent-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+.agent-item:hover {
+  background: rgba(0, 240, 255, 0.05);
+}
+
+.agent-item.active {
+  background: rgba(0, 240, 255, 0.1);
+  border-left: 2px solid var(--cyan);
+}
+
+.agent-color {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.agent-info { flex: 1; }
+
+.agent-name { font-weight: 600; color: var(--text-primary); }
+.agent-role { font-size: 10px; color: var(--text-secondary); }
+
+.agent-status {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(0, 255, 136, 0.1);
+  color: var(--green);
+}
+
+.agent-status.processing {
+  background: rgba(255, 0, 170, 0.1);
+  color: var(--magenta);
+  animation: processing-pulse 1s ease-in-out infinite;
+}
+
+@keyframes processing-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Metrics */
+.metric-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.metric-card {
+  background: var(--glass);
+  border: 1px solid var(--border-glow);
+  border-radius: 8px;
+  padding: 12px;
+  text-align: center;
+}
+
+.metric-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--cyan);
+  text-shadow: 0 0 20px rgba(0, 240, 255, 0.3);
+}
+
+.metric-label {
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-top: 4px;
+}
+
+/* Message Log */
+.message-item {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+  border-left: 2px solid transparent;
+  animation: message-in 0.3s ease-out;
+}
+
+@keyframes message-in {
+  from { opacity: 0; transform: translateX(-10px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.msg-directive { border-left-color: var(--cyan); background: rgba(0, 240, 255, 0.03); }
+.msg-query { border-left-color: var(--purple); background: rgba(184, 41, 221, 0.03); }
+.msg-result { border-left-color: var(--green); background: rgba(0, 255, 136, 0.03); }
+.msg-validation { border-left-color: var(--gold); background: rgba(255, 215, 0, 0.03); }
+.msg-synthesis { border-left-color: var(--magenta); background: rgba(255, 0, 170, 0.03); }
+
+.msg-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 2px;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.msg-type {
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.msg-payload {
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Expression Tree Panel */
+#tree-canvas {
+  width: 100%;
+  height: 160px;
+}
+
+/* Controls */
+.controls {
+  position: fixed;
+  bottom: 240px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 12px;
+  z-index: 20;
+}
+
+.btn {
+  padding: 10px 24px;
+  border: 1px solid var(--border-glow);
+  background: var(--bg-panel);
+  backdrop-filter: blur(10px);
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.btn:hover {
+  border-color: var(--cyan);
+  box-shadow: 0 0 20px rgba(0, 240, 255, 0.2);
+  color: var(--cyan);
+}
+
+.btn.primary {
+  background: rgba(0, 240, 255, 0.1);
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+
+.btn.primary:hover {
+  background: rgba(0, 240, 255, 0.2);
+  box-shadow: 0 0 30px rgba(0, 240, 255, 0.3);
+}
+
+/* Task Injection Modal */
+.modal-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.8);
+  backdrop-filter: blur(10px);
+  z-index: 100;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-overlay.active { display: flex; }
+
+.modal {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-glow);
+  border-radius: 16px;
+  padding: 32px;
+  width: 500px;
+  max-width: 90vw;
+  box-shadow: 0 0 60px rgba(0, 240, 255, 0.1);
+}
+
+.modal h2 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 18px;
+  margin-bottom: 20px;
+  color: var(--cyan);
+}
+
+.modal textarea {
+  width: 100%;
+  height: 120px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-glow);
+  border-radius: 8px;
+  padding: 12px;
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  resize: none;
+  margin-bottom: 20px;
+}
+
+.modal textarea:focus {
+  outline: none;
+  border-color: var(--cyan);
+  box-shadow: 0 0 20px rgba(0, 240, 255, 0.1);
+}
+
+.modal-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+/* Tooltip */
+.tooltip {
+  position: absolute;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-glow);
+  border-radius: 8px;
+  padding: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  pointer-events: none;
+  z-index: 50;
+  display: none;
+  max-width: 300px;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+}
+
+.tooltip.active { display: block; }
+
+/* Convergence Banner */
+.convergence-banner {
+  position: fixed;
+  top: 80px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-100px);
+  background: rgba(0, 255, 136, 0.1);
+  border: 1px solid var(--green);
+  border-radius: 12px;
+  padding: 16px 32px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  color: var(--green);
+  z-index: 30;
+  transition: transform 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.convergence-banner.show {
+  transform: translateX(-50%) translateY(0);
+}
+
+/* Responsive */
+@media (max-width: 1200px) {
+  .left-panel, .right-panel { width: 260px; }
+}
+</style>
+</head>
+<body>
+
+<!-- Canvas Layers -->
+<div id="canvas-container">
+  <canvas id="bg-canvas"></canvas>
+  <canvas id="main-canvas"></canvas>
+</div>
+
+<!-- Header -->
+<div class="ui-layer header">
+  <div class="brand">
+    <div class="brand-icon">α</div>
+    <div class="brand-text">
+      <h1>ASIS</h1>
+      <span>Algebraic Swarm Intelligence</span>
+    </div>
+  </div>
+  <div class="status-badge">
+    <div class="status-dot"></div>
+    <span id="system-status">SYSTEM ONLINE</span>
+  </div>
+</div>
+
+<!-- Left Panel: Agents -->
+<div class="ui-layer left-panel panel">
+  <div class="panel-header">
+    <span>Swarm Agents</span>
+    <span id="agent-count">6 Active</span>
+  </div>
+  <div class="panel-body" id="agent-list"></div>
+</div>
+
+<!-- Right Panel: Metrics -->
+<div class="ui-layer right-panel panel">
+  <div class="panel-header">
+    <span>System Metrics</span>
+    <span id="step-counter">Step 0</span>
+  </div>
+  <div class="panel-body">
+    <div class="metric-grid">
+      <div class="metric-card">
+        <div class="metric-value" id="metric-messages">0</div>
+        <div class="metric-label">Messages</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value" id="metric-throughput">0</div>
+        <div class="metric-label">Throughput</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value" id="metric-tasks">0</div>
+        <div class="metric-label">Tasks</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value" id="metric-convergence">--</div>
+        <div class="metric-label">Convergence</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Bottom Panel: Message Log & Expression Tree -->
+<div class="ui-layer bottom-panel">
+  <div class="panel" style="flex: 1.5;">
+    <div class="panel-header">
+      <span>Message Stream</span>
+      <span id="message-rate">0 msg/s</span>
+    </div>
+    <div class="panel-body" id="message-log"></div>
+  </div>
+  <div class="panel" style="flex: 1;">
+    <div class="panel-header">
+      <span>Expression Tree</span>
+      <span id="tree-depth">Depth: 0</span>
+    </div>
+    <div class="panel-body" style="padding: 0;">
+      <canvas id="tree-canvas"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- Controls -->
+<div class="ui-layer controls">
+  <button class="btn" onclick="togglePause()" id="pause-btn">Pause</button>
+  <button class="btn primary" onclick="openModal()">Inject Task</button>
+  <button class="btn" onclick="resetSimulation()">Reset</button>
+</div>
+
+<!-- Convergence Banner -->
+<div class="convergence-banner" id="convergence-banner">
+  <span>✦</span>
+  <span>FIXED POINT REACHED — SWARM CONVERGED</span>
+</div>
+
+<!-- Task Modal -->
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h2>Inject Algebraic Task</h2>
+    <textarea id="task-input" placeholder="Enter task expression...
+Example: optimize_system ⊗ latency<100ms ⊗ throughput>1000rps"></textarea>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" onclick="injectTask()">Inject</button>
+    </div>
+  </div>
+</div>
+
+<!-- Tooltip -->
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+// ============================================================================
+// ASIS SIMULATION ENGINE (JavaScript)
+// ============================================================================
+
+const AGENT_CONFIGS = [
+  { id: 'orchestrator', role: 'ORCHESTRATOR', color: '#00f0ff', x: 0, y: -120 },
+  { id: 'analyst', role: 'ANALYST', color: '#b829dd', x: -180, y: -40 },
+  { id: 'planner', role: 'PLANNER', color: '#ff00aa', x: 180, y: -40 },
+  { id: 'executor', role: 'EXECUTOR', color: '#00ff88', x: -120, y: 100 },
+  { id: 'validator', role: 'VALIDATOR', color: '#ffd700', x: 0, y: 140 },
+  { id: 'synthesizer', role: 'SYNTHESIZER', color: '#ff8800', x: 120, y: 100 }
+];
+
+const MESSAGE_TYPES = {
+  DIRECTIVE: { color: '#00f0ff', class: 'msg-directive' },
+  QUERY: { color: '#b829dd', class: 'msg-query' },
+  RESULT: { color: '#00ff88', class: 'msg-result' },
+  VALIDATION: { color: '#ffd700', class: 'msg-validation' },
+  SYNTHESIS: { color: '#ff00aa', class: 'msg-synthesis' },
+  DELEGATION: { color: '#ff8800', class: 'msg-directive' },
+  FEEDBACK: { color: '#ff4444', class: 'msg-validation' }
+};
+
+class ConceptAtom {
+  constructor(name, category, domain = 'general', metadata = {}) {
+    this.name = name;
+    this.category = category;
+    this.domain = domain;
+    this.metadata = metadata;
+  }
+  serialize() { return `ATOM(${this.name}:${this.category}:${this.domain})`; }
+}
+
+class Expression {
+  constructor(operator = null, operands = [], bindings = {}) {
+    this.operator = operator;
+    this.operands = operands;
+    this.bindings = bindings;
+    this._depth = null;
+  }
+
+  static fromAtom(atom) { return new Expression(null, [atom]); }
+  static compose(...exprs) { return new Expression('⊗', exprs); }
+  static union(...exprs) { return new Expression('⊕', exprs); }
+  static guard(cond, body) { return new Expression('γ', [cond, body]); }
+
+  get isLeaf() { return !this.operator && this.operands.length === 1 && this.operands[0] instanceof ConceptAtom; }
+  get atom() { return this.isLeaf ? this.operands[0] : null; }
+
+  get depth() {
+    if (this._depth !== null) return this._depth;
+    if (this.isLeaf) return this._depth = 0;
+    return this._depth = 1 + Math.max(...this.operands.map(o => o instanceof Expression ? o.depth : 0));
+  }
+
+  serialize() {
+    if (this.isLeaf) return this.operands[0].serialize();
+    const parts = [this.operator];
+    if (Object.keys(this.bindings).length) {
+      const b = Object.entries(this.bindings).map(([k,v]) => `${k}=${v}`).join(',');
+      parts.push(`[${b}]`);
+    }
+    for (const o of this.operands) parts.push(o instanceof Expression ? o.serialize() : o.serialize());
+    return `(${parts.join(' ')})`;
+  }
+
+  toDict() {
+    if (this.isLeaf) return { type: 'atom', name: this.atom.name, category: this.atom.category };
+    return {
+      type: 'expression',
+      operator: this.operator,
+      bindings: this.bindings,
+      operands: this.operands.map(o => o.toDict())
+    };
+  }
+}
+
+// Factory
+const C = {
+  entity: (n, d='general', m={}) => Expression.fromAtom(new ConceptAtom(n, 'ENTITY', d, m)),
+  action: (n, d='general', m={}) => Expression.fromAtom(new ConceptAtom(n, 'ACTION', d, m)),
+  goal: (n, d='general', m={}) => Expression.fromAtom(new ConceptAtom(n, 'GOAL', d, m)),
+  constraint: (n, d='general', m={}) => Expression.fromAtom(new ConceptAtom(n, 'CONSTRAINT', d, m)),
+  state: (n, d='general', m={}) => Expression.fromAtom(new ConceptAtom(n, 'STATE', d, m)),
+  property: (n, d='general', m={}) => Expression.fromAtom(new ConceptAtom(n, 'PROPERTY', d, m)),
+  compose: (...exprs) => Expression.compose(...exprs),
+  union: (...exprs) => Expression.union(...exprs),
+  guard: (c, b) => Expression.guard(c, b)
+};
+
+class Agent {
+  constructor(config) {
+    this.id = config.id;
+    this.role = config.role;
+    this.color = config.color;
+    this.x = config.x;
+    this.y = config.y;
+    this.vx = 0;
+    this.vy = 0;
+    this.targetX = config.x;
+    this.targetY = config.y;
+    this.state = 'idle';
+    this.inbox = [];
+    this.processed = 0;
+    this.knowledge = {};
+    this.pulsePhase = Math.random() * Math.PI * 2;
+    this.connections = new Set();
+  }
+
+  receive(msg) { this.inbox.push(msg); }
+
+  process(blackboard, step) {
+    const responses = [];
+    while (this.inbox.length > 0) {
+      const msg = this.inbox.shift();
+      this.state = 'processing';
+      this.processed++;
+
+      // Agent-specific logic
+      const r = this._handle(msg, blackboard, step);
+      responses.push(...r);
+
+      // Update connections
+      this.connections.add(msg.sender);
+      if (r.length > 0) {
+        r.forEach(m => {
+          const target = simulation.agents.find(a => a.id === m.receiver);
+          if (target) target.connections.add(this.id);
+        });
+      }
+    }
+    if (this.inbox.length === 0) this.state = 'idle';
+    return responses;
+  }
+
+  _handle(msg, bb, step) {
+    const payload = msg.payload;
+
+    switch(this.role) {
+      case 'ORCHESTRATOR':
+        if (msg.type === 'DIRECTIVE') {
+          const taskId = hash(payload.serialize()).slice(0,8);
+          bb.set(`task:${taskId}`, payload);
+          if (payload.operator === '⊗') {
+            return [new Message(this.id, 'planner', 'DELEGATION', 
+              C.compose(C.goal('plan_task', 'general', {task_id: taskId}), payload), step)];
+          }
+          return [new Message(this.id, 'analyst', 'DELEGATION', payload, step)];
+        }
+        if (msg.type === 'RESULT') {
+          if (msg.sender === 'synthesizer') {
+            const taskId = msg.payload.bindings.task_id || 'unknown';
+            bb.set(`result:${taskId}`, msg.payload);
+          } else {
+            return [new Message(this.id, 'synthesizer', 'SYNTHESIS', msg.payload, step)];
+          }
+        }
+        return [];
+
+      case 'ANALYST':
+        if (msg.type === 'DELEGATION') {
+          const analyzed = C.compose(C.action('analyze_requirements'), C.action('identify_constraints'), C.action('assess_feasibility'));
+          const key = `analysis:${hash(msg.payload.serialize()).slice(0,8)}`;
+          bb.set(key, analyzed);
+          return [new Message(this.id, 'orchestrator', 'RESULT', C.compose(C.state('analyzed'), analyzed), step)];
+        }
+        return [];
+
+      case 'PLANNER':
+        if (msg.type === 'DELEGATION') {
+          const plan = C.compose(
+            C.action('prepare', 'general', {phase: '1'}),
+            C.action('execute_core', 'general', {phase: '2'}),
+            C.action('validate', 'general', {phase: '3'}),
+            C.action('finalize', 'general', {phase: '4'})
+          );
+          const key = `plan:${hash(msg.payload.serialize()).slice(0,8)}`;
+          bb.set(key, plan);
+          return [
+            new Message(this.id, 'executor', 'DIRECTIVE', plan, step),
+            new Message(this.id, 'orchestrator', 'RESULT', C.compose(C.state('planned'), plan), step)
+          ];
+        }
+        return [];
+
+      case 'EXECUTOR':
+        if (msg.type === 'DIRECTIVE') {
+          let result;
+          if (payload.operator === '⊗') {
+            const steps = payload.operands.map((op, i) => 
+              C.compose(C.state('executed', 'general', {step: i, status: 'success'}), op)
+            );
+            result = steps.length > 1 ? C.compose(...steps) : steps[0];
+          } else {
+            result = C.compose(C.state('executed'), payload);
+          }
+          const key = `execution:${hash(msg.payload.serialize()).slice(0,8)}`;
+          bb.set(key, result);
+          return [new Message(this.id, 'validator', 'VALIDATION', result, step)];
+        }
+        return [];
+
+      case 'VALIDATOR':
+        if (msg.type === 'VALIDATION') {
+          const isValid = !payload.serialize().includes('error');
+          const result = C.compose(C.state('validated', 'general', {status: isValid ? 'passed' : 'failed'}), payload);
+          const key = `validation:${hash(msg.payload.serialize()).slice(0,8)}`;
+          bb.set(key, result);
+          if (isValid) {
+            return [new Message(this.id, 'synthesizer', 'SYNTHESIS', result, step)];
+          } else {
+            return [new Message(this.id, 'executor', 'FEEDBACK', result, step)];
+          }
+        }
+        return [];
+
+      case 'SYNTHESIZER':
+        if (msg.type === 'SYNTHESIS') {
+          const synthesized = C.compose(C.state('synthesized', 'general', {agent: this.id}), msg.payload);
+          const key = `synthesis:${hash(msg.payload.serialize()).slice(0,8)}`;
+          bb.set(key, synthesized);
+          return [new Message(this.id, 'orchestrator', 'RESULT', synthesized, step)];
+        }
+        return [];
+    }
+    return [];
+  }
+}
+
+class Message {
+  constructor(sender, receiver, type, payload, step) {
+    this.sender = sender;
+    this.receiver = receiver;
+    this.type = type;
+    this.payload = payload;
+    this.step = step;
+    this.id = Math.random().toString(36).slice(2, 10);
+    this.timestamp = Date.now();
+    this.progress = 0;
+    this.speed = 0.02 + Math.random() * 0.03;
+  }
+
+  get displayText() {
+    const p = this.payload.serialize();
+    return p.length > 50 ? p.slice(0, 50) + '...' : p;
+  }
+}
+
+class Blackboard {
+  constructor() {
+    this.data = new Map();
+    this.history = [];
+  }
+  set(key, value) {
+    this.data.set(key, value);
+    this.history.push({key, value: value.serialize(), time: Date.now()});
+  }
+  get(key) { return this.data.get(key); }
+  getAll() { return Array.from(this.data.entries()).map(([k,v]) => ({key: k, value: v.serialize()})); }
+}
+
+function hash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h) + str.charCodeAt(i);
+    h |= 0;
+  }
+  return Math.abs(h).toString(16);
+}
+
+// ============================================================================
+// VISUALIZATION ENGINE
+// ============================================================================
+
+class Simulation {
+  constructor() {
+    this.agents = AGENT_CONFIGS.map(c => new Agent(c));
+    this.blackboard = new Blackboard();
+    this.messages = [];
+    this.activePackets = [];
+    this.step = 0;
+    this.running = true;
+    this.converged = false;
+    this.convergenceCount = 0;
+    this.messageLog = [];
+    this.maxLogSize = 50;
+    this.tasks = 0;
+    this.paused = false;
+
+    // Canvas setup
+    this.bgCanvas = document.getElementById('bg-canvas');
+    this.mainCanvas = document.getElementById('main-canvas');
+    this.bgCtx = this.bgCanvas.getContext('2d');
+    this.ctx = this.mainCanvas.getContext('2d');
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+
+    // Mouse interaction
+    this.mouseX = 0;
+    this.mouseY = 0;
+    this.hoveredAgent = null;
+    this.mainCanvas.addEventListener('mousemove', e => {
+      this.mouseX = e.clientX;
+      this.mouseY = e.clientY;
+    });
+    this.mainCanvas.addEventListener('click', e => {
+      if (this.hoveredAgent) {
+        this.selectedAgent = this.hoveredAgent;
+      }
+    });
+
+    this.selectedAgent = null;
+    this.particles = [];
+    this.gridOffset = 0;
+
+    this.setupUI();
+    this.loop();
+  }
+
+  resize() {
+    this.width = window.innerWidth;
+    this.height = window.innerHeight;
+    this.bgCanvas.width = this.width;
+    this.bgCanvas.height = this.height;
+    this.mainCanvas.width = this.width;
+    this.mainCanvas.height = this.height;
+    this.centerX = this.width / 2;
+    this.centerY = this.height / 2;
+  }
+
+  setupUI() {
+    this.updateAgentList();
+  }
+
+  injectTask(expression) {
+    this.tasks++;
+    const msg = new Message('user', 'orchestrator', 'DIRECTIVE', expression, this.step);
+    const orch = this.agents.find(a => a.id === 'orchestrator');
+    orch.receive(msg);
+    this.messages.push(msg);
+    this.addLogEntry(msg);
+    this.converged = false;
+    this.convergenceCount = 0;
+    document.getElementById('convergence-banner').classList.remove('show');
+  }
+
+  stepSimulation() {
+    if (this.paused || this.converged) return;
+
+    this.step++;
+    let activity = 0;
+    const newMessages = [];
+
+    for (const agent of this.agents) {
+      const responses = agent.process(this.blackboard, this.step);
+      for (const msg of responses) {
+        newMessages.push(msg);
+        activity++;
+      }
+    }
+
+    for (const msg of newMessages) {
+      const target = this.agents.find(a => a.id === msg.receiver);
+      if (target) {
+        target.receive(msg);
+        this.activePackets.push({
+          message: msg,
+          from: this.agents.find(a => a.id === msg.sender),
+          to: target,
+          progress: 0,
+          speed: 0.015 + Math.random() * 0.02
+        });
+      }
+      this.messages.push(msg);
+      this.addLogEntry(msg);
+    }
+
+    // Convergence detection
+    if (activity === 0) {
+      this.convergenceCount++;
+      if (this.convergenceCount >= 3) {
+        this.converged = true;
+        document.getElementById('convergence-banner').classList.add('show');
+        setTimeout(() => {
+          document.getElementById('convergence-banner').classList.remove('show');
+        }, 4000);
+      }
+    } else {
+      this.convergenceCount = 0;
+    }
+
+    // Update UI
+    document.getElementById('step-counter').textContent = `Step ${this.step}`;
+    document.getElementById('metric-messages').textContent = this.messages.length;
+    document.getElementById('metric-throughput').textContent = activity;
+    document.getElementById('metric-tasks').textContent = this.tasks;
+    document.getElementById('metric-convergence').textContent = this.converged ? 'YES' : 'NO';
+    document.getElementById('metric-convergence').style.color = this.converged ? 'var(--green)' : 'var(--text-secondary)';
+
+    this.updateAgentList();
+  }
+
+  addLogEntry(msg) {
+    const log = document.getElementById('message-log');
+    const entry = document.createElement('div');
+    const mt = MESSAGE_TYPES[msg.type] || { color: '#888', class: '' };
+    entry.className = `message-item ${mt.class}`;
+    entry.innerHTML = `
+      <div class="msg-header">
+        <span><strong>${msg.sender}</strong> → <strong>${msg.receiver}</strong></span>
+        <span class="msg-type" style="color: ${mt.color}">${msg.type}</span>
+      </div>
+      <div class="msg-payload">${msg.displayText}</div>
+    `;
+    log.insertBefore(entry, log.firstChild);
+    while (log.children.length > this.maxLogSize) {
+      log.removeChild(log.lastChild);
+    }
+  }
+
+  updateAgentList() {
+    const list = document.getElementById('agent-list');
+    list.innerHTML = '';
+    for (const agent of this.agents) {
+      const item = document.createElement('div');
+      item.className = `agent-item ${this.selectedAgent === agent ? 'active' : ''}`;
+      item.innerHTML = `
+        <div class="agent-color" style="background: ${agent.color}; box-shadow: 0 0 10px ${agent.color}"></div>
+        <div class="agent-info">
+          <div class="agent-name">${agent.id}</div>
+          <div class="agent-role">${agent.role} • ${agent.processed} processed</div>
+        </div>
+        <div class="agent-status ${agent.state}">${agent.state}</div>
+      `;
+      item.addEventListener('click', () => {
+        this.selectedAgent = agent;
+        this.updateAgentList();
+      });
+      list.appendChild(item);
+    }
+  }
+
+  // ============================================================================
+  // RENDERING
+  // ============================================================================
+
+  drawBackground() {
+    const ctx = this.bgCtx;
+    ctx.fillStyle = '#050508';
+    ctx.fillRect(0, 0, this.width, this.height);
+
+    // Grid
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.03)';
+    ctx.lineWidth = 1;
+    const gridSize = 50;
+    this.gridOffset = (this.gridOffset + 0.2) % gridSize;
+
+    for (let x = this.gridOffset; x < this.width; x += gridSize) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, this.height);
+      ctx.stroke();
+    }
+    for (let y = this.gridOffset; y < this.height; y += gridSize) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(this.width, y);
+      ctx.stroke();
+    }
+
+    // Subtle vignette
+    const gradient = ctx.createRadialGradient(this.centerX, this.centerY, 0, this.centerX, this.centerY, Math.max(this.width, this.height) * 0.7);
+    gradient.addColorStop(0, 'rgba(0, 240, 255, 0.01)');
+    gradient.addColorStop(1, 'rgba(0, 0, 0, 0.4)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, this.width, this.height);
+  }
+
+  drawConnections() {
+    const ctx = this.ctx;
+
+    for (const agent of this.agents) {
+      for (const otherId of agent.connections) {
+        const other = this.agents.find(a => a.id === otherId);
+        if (!other) continue;
+
+        const x1 = this.centerX + agent.x;
+        const y1 = this.centerY + agent.y;
+        const x2 = this.centerX + other.x;
+        const y2 = this.centerY + other.y;
+
+        const dist = Math.hypot(x2 - x1, y2 - y1);
+        const opacity = Math.max(0.02, 0.15 - dist / 2000);
+
+        ctx.strokeStyle = `rgba(0, 240, 255, ${opacity})`;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  drawPackets() {
+    const ctx = this.ctx;
+
+    for (let i = this.activePackets.length - 1; i >= 0; i--) {
+      const pkt = this.activePackets[i];
+      pkt.progress += pkt.speed;
+
+      if (pkt.progress >= 1) {
+        this.activePackets.splice(i, 1);
+        continue;
+      }
+
+      const from = pkt.from;
+      const to = pkt.to;
+      const x1 = this.centerX + from.x;
+      const y1 = this.centerY + from.y;
+      const x2 = this.centerX + to.x;
+      const y2 = this.centerY + to.y;
+
+      const t = pkt.progress;
+      const x = x1 + (x2 - x1) * t;
+      const y = y1 + (y2 - y1) * t;
+
+      const mt = MESSAGE_TYPES[pkt.message.type] || { color: '#fff' };
+
+      // Packet glow
+      ctx.shadowBlur = 15;
+      ctx.shadowColor = mt.color;
+      ctx.fillStyle = mt.color;
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      // Trail
+      ctx.strokeStyle = mt.color;
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.3 * (1 - t);
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      // Add particles on packet
+      if (Math.random() < 0.3) {
+        this.particles.push({
+          x, y,
+          vx: (Math.random() - 0.5) * 2,
+          vy: (Math.random() - 0.5) * 2,
+          life: 1,
+          color: mt.color,
+          size: 1 + Math.random() * 2
+        });
+      }
+    }
+  }
+
+  drawAgents() {
+    const ctx = this.ctx;
+    this.hoveredAgent = null;
+
+    for (const agent of this.agents) {
+      const x = this.centerX + agent.x;
+      const y = this.centerY + agent.y;
+
+      // Check hover
+      const dx = this.mouseX - x;
+      const dy = this.mouseY - y;
+      const dist = Math.hypot(dx, dy);
+      const isHovered = dist < 30;
+      if (isHovered) this.hoveredAgent = agent;
+
+      const isSelected = this.selectedAgent === agent;
+      const radius = isSelected ? 28 : (isHovered ? 26 : 22);
+
+      // Pulse effect
+      agent.pulsePhase += 0.02;
+      const pulse = Math.sin(agent.pulsePhase) * 0.3 + 0.7;
+
+      // Outer glow
+      if (agent.state === 'processing') {
+        ctx.shadowBlur = 20 + pulse * 10;
+        ctx.shadowColor = agent.color;
+      } else {
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = agent.color;
+      }
+
+      // Agent circle
+      const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
+      gradient.addColorStop(0, agent.color + '40');
+      gradient.addColorStop(0.6, agent.color + '20');
+      gradient.addColorStop(1, agent.color + '10');
+
+      ctx.fillStyle = gradient;
+      ctx.strokeStyle = agent.color;
+      ctx.lineWidth = isSelected ? 3 : 2;
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // Inner dot
+      ctx.fillStyle = agent.color;
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Ring for processing
+      if (agent.state === 'processing') {
+        ctx.strokeStyle = agent.color;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.lineDashOffset = -agent.pulsePhase * 10;
+        ctx.beginPath();
+        ctx.arc(x, y, radius + 8, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Label
+      ctx.fillStyle = '#fff';
+      ctx.font = '600 11px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(agent.id.toUpperCase(), x, y + radius + 18);
+
+      ctx.font = '400 9px "JetBrains Mono", monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillText(agent.role, x, y + radius + 32);
+
+      // Inbox indicator
+      if (agent.inbox.length > 0) {
+        ctx.fillStyle = '#ff00aa';
+        ctx.beginPath();
+        ctx.arc(x + radius - 5, y - radius + 5, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 9px sans-serif';
+        ctx.fillText(agent.inbox.length.toString(), x + radius - 5, y - radius + 5);
+      }
+    }
+  }
+
+  drawParticles() {
+    const ctx = this.ctx;
+
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.life -= 0.02;
+      p.size *= 0.98;
+
+      if (p.life <= 0) {
+        this.particles.splice(i, 1);
+        continue;
+      }
+
+      ctx.globalAlpha = p.life * 0.6;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  drawExpressionTree() {
+    const canvas = document.getElementById('tree-canvas');
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width;
+    const h = rect.height;
+
+    ctx.fillStyle = 'transparent';
+    ctx.clearRect(0, 0, w, h);
+
+    // Get latest expression from blackboard
+    const entries = this.blackboard.getAll();
+    const latest = entries[entries.length - 1];
+    if (!latest) {
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.font = '12px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('No expressions yet...', w/2, h/2);
+      return;
+    }
+
+    document.getElementById('tree-depth').textContent = `Entries: ${entries.length}`;
+
+    // Simple text visualization of latest expression
+    ctx.fillStyle = 'var(--cyan)';
+    ctx.font = '11px "JetBrains Mono", monospace';
+    ctx.textAlign = 'left';
+
+    const text = latest.value;
+    const maxChars = Math.floor(w / 7);
+    const lines = [];
+    for (let i = 0; i < text.length; i += maxChars) {
+      lines.push(text.slice(i, i + maxChars));
+    }
+
+    let y = 20;
+    for (const line of lines.slice(0, 8)) {
+      ctx.fillText(line, 12, y);
+      y += 16;
+    }
+    if (lines.length > 8) {
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      ctx.fillText(`... and ${lines.length - 8} more lines`, 12, y);
+    }
+
+    // Draw mini tree visualization
+    if (y < h - 40) {
+      this.drawMiniTree(ctx, latest.value, w/2, y + 20, w/2 - 20, 30);
+    }
+  }
+
+  drawMiniTree(ctx, text, x, y, width, height) {
+    // Simplified tree visualization
+    const depth = (text.match(/\(/g) || []).length;
+    const maxDepth = Math.min(depth, 5);
+
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.2)';
+    ctx.lineWidth = 1;
+
+    const nodeY = y;
+    const nodeRadius = 4;
+
+    ctx.fillStyle = 'var(--cyan)';
+    ctx.beginPath();
+    ctx.arc(x, nodeY, nodeRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (maxDepth > 1) {
+      const childCount = Math.min(3, maxDepth);
+      const spacing = width / childCount;
+
+      for (let i = 0; i < childCount; i++) {
+        const childX = x - width/2 + spacing * i + spacing/2;
+        const childY = nodeY + height;
+
+        ctx.beginPath();
+        ctx.moveTo(x, nodeY + nodeRadius);
+        ctx.lineTo(childX, childY - nodeRadius);
+        ctx.stroke();
+
+        ctx.fillStyle = `hsl(${180 + i * 40}, 80%, 60%)`;
+        ctx.beginPath();
+        ctx.arc(childX, childY, nodeRadius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  drawTooltip() {
+    const tooltip = document.getElementById('tooltip');
+    if (this.hoveredAgent) {
+      const agent = this.hoveredAgent;
+      tooltip.classList.add('active');
+      tooltip.style.left = (this.mouseX + 15) + 'px';
+      tooltip.style.top = (this.mouseY + 15) + 'px';
+      tooltip.innerHTML = `
+        <div style="color: ${agent.color}; font-weight: bold; margin-bottom: 4px;">${agent.id.toUpperCase()}</div>
+        <div>Role: ${agent.role}</div>
+        <div>State: <span style="color: ${agent.state === 'processing' ? 'var(--magenta)' : 'var(--green)'}">${agent.state}</span></div>
+        <div>Processed: ${agent.processed} messages</div>
+        <div>Inbox: ${agent.inbox.length} pending</div>
+      `;
+    } else {
+      tooltip.classList.remove('active');
+    }
+  }
+
+  loop() {
+    this.drawBackground();
+
+    this.ctx.clearRect(0, 0, this.width, this.height);
+
+    this.drawConnections();
+    this.drawPackets();
+    this.drawAgents();
+    this.drawParticles();
+    this.drawExpressionTree();
+    this.drawTooltip();
+
+    requestAnimationFrame(() => this.loop());
+  }
+}
+
+// ============================================================================
+// CONTROLS
+// ============================================================================
+
+const simulation = new Simulation();
+
+// Auto-step
+setInterval(() => {
+  simulation.stepSimulation();
+}, 800);
+
+// Initial task
+setTimeout(() => {
+  simulation.injectTask(C.compose(
+    C.goal('optimize_system'),
+    C.constraint('latency < 100ms'),
+    C.constraint('throughput > 1000rps')
+  ));
+}, 500);
+
+function togglePause() {
+  simulation.paused = !simulation.paused;
+  document.getElementById('pause-btn').textContent = simulation.paused ? 'Resume' : 'Pause';
+}
+
+function resetSimulation() {
+  simulation.agents = AGENT_CONFIGS.map(c => new Agent(c));
+  simulation.blackboard = new Blackboard();
+  simulation.messages = [];
+  simulation.activePackets = [];
+  simulation.step = 0;
+  simulation.converged = false;
+  simulation.convergenceCount = 0;
+  simulation.tasks = 0;
+  simulation.messageLog = [];
+  document.getElementById('message-log').innerHTML = '';
+  document.getElementById('convergence-banner').classList.remove('show');
+  simulation.updateAgentList();
+}
+
+function openModal() {
+  document.getElementById('modal').classList.add('active');
+  document.getElementById('task-input').focus();
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('active');
+}
+
+function injectTask() {
+  const input = document.getElementById('task-input').value.trim();
+  if (!input) return;
+
+  // Parse simple expression
+  let expr;
+  if (input.includes('⊗')) {
+    const parts = input.split('⊗').map(s => s.trim());
+    const atoms = parts.map(p => {
+      if (p.includes('<') || p.includes('>')) return C.constraint(p);
+      if (p.includes('goal') || p.includes('optimize') || p.includes('solve')) return C.goal(p);
+      return C.action(p);
+    });
+    expr = C.compose(...atoms);
+  } else {
+    expr = C.goal(input);
+  }
+
+  simulation.injectTask(expr);
+  closeModal();
+  document.getElementById('task-input').value = '';
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+  if (e.key === ' ' && e.target.tagName !== 'TEXTAREA') {
+    e.preventDefault();
+    togglePause();
+  }
+  if (e.key === 'Enter' && e.ctrlKey) {
+    openModal();
+  }
+});
+
+// Click outside modal to close
+document.getElementById('modal').addEventListener('click', e => {
+  if (e.target.id === 'modal') closeModal();
+});
+</script>
+</body>
+</html>

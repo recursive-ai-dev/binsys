@@ -1,0 +1,736 @@
+#!/bin/sh
+#═══════════════════════════════════════════════════════════════════════════════
+#  plugin-from-apk — FrugalOS Plugin Builder from Alpine APK Packages
+#
+#  Alpine Linux uses musl libc natively, making its packages binary-compatible
+#  with FrugalOS base.sfs. This tool downloads APK packages, strips Alpine-
+#  specific metadata, and packs them as FrugalOS .sfs plugins.
+#
+#  Why Alpine:
+#    - musl-native = zero glibc contamination
+#    - ~5000 packages available
+#    - apk is dependency-aware and reproducible
+#    - packages are small (no systemd, no dbus by default)
+#
+#  Usage:
+#    plugin-from-apk <package> [package...]
+#    plugin-from-apk --split vim        → one .sfs per package + deps
+#    plugin-from-apk --bundle vim       → all deps in one .sfs (default)
+#    plugin-from-apk --deps-only vim    → just show dep tree, no build
+#
+#  Options:
+#    --bundle              all deps packed in one .sfs (default)
+#    --split               one .sfs per package, DEPENDS set between them
+#    --no-docs             strip man pages + /usr/share/doc (default: strip)
+#    --include-docs        keep man pages and docs
+#    --no-strip            don't strip debug symbols from ELF binaries
+#    --order <1-99>        LOAD_ORDER for output plugin (default: 50)
+#    --name  <name>        output plugin name (bundle mode, default: <package>)
+#    --out   <dir>         output dir (default: BOOT_MOUNT/plugins/available/)
+#    --chroot <dir>        reuse existing Alpine chroot
+#    --deps-only           print dep tree and exit
+#    --keep                keep staging directory after build
+#═══════════════════════════════════════════════════════════════════════════════
+
+set -e
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export PATH
+
+#───────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+#───────────────────────────────────────────────────────────────────────────────
+
+ALPINE_VERSION="3.19"
+ALPINE_ARCH="x86_64"
+ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.0-${ALPINE_ARCH}.tar.gz"
+ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE_MINIROOTFS}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="${SCRIPT_DIR}/build"
+
+# Default Alpine chroot — reuse build-base-sfs output if present
+CHROOT_DIR="${CHROOT_DIR:-${BUILD_DIR}/alpine-chroot}"
+
+OUTPUT_DIR=""   # set after overlay.env is read, or via --out
+
+# Packages that base.sfs already provides — never extracted into plugins.
+# Extracting these would waste space and could cause version conflicts.
+BASE_PROVIDED="
+musl musl-utils
+busybox busybox-static busybox-extras busybox-binsh
+ssl_client
+scanelf
+"
+
+#───────────────────────────────────────────────────────────────────────────────
+# OPTIONS
+#───────────────────────────────────────────────────────────────────────────────
+
+OPT_MODE="bundle"
+OPT_DOCS=0          # 0 = strip (default), 1 = keep
+OPT_STRIP=1         # 1 = strip debug symbols (default)
+OPT_ORDER=50
+OPT_NAME=""
+OPT_OUT=""
+OPT_CHROOT=""
+OPT_DEPS_ONLY=0
+OPT_KEEP=0
+PACKAGES=""
+
+#───────────────────────────────────────────────────────────────────────────────
+# LOGGING
+#───────────────────────────────────────────────────────────────────────────────
+
+log()    { printf '\033[1;32m=>\033[0m %s\n' "$*"; }
+info()   { printf '   %s\n' "$*"; }
+warn()   { printf '\033[1;33mwarn:\033[0m %s\n' "$*" >&2; }
+die()    { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+ok()     { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
+step()   { printf '\n\033[1;37m── %s\033[0m\n' "$*"; }
+dim()    { printf '\033[0;37m   %s\033[0m\n' "$*"; }
+
+#───────────────────────────────────────────────────────────────────────────────
+# USAGE
+#───────────────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+
+plugin-from-apk — FrugalOS .sfs Plugin Builder (Alpine APK source)
+
+Usage:
+  plugin-from-apk [options] <package> [package...]
+
+Modes:
+  --bundle          all packages + deps → one .sfs (default)
+  --split           one .sfs per package, DEPENDS set between them
+  --deps-only       print dependency tree, exit without building
+
+Options:
+  --name  <name>    plugin name in bundle mode (default: first package)
+  --order <1-99>    LOAD_ORDER in manifest (default: 50)
+  --out   <dir>     output directory (default: /mnt/boot/plugins/available/)
+  --chroot <dir>    reuse existing Alpine chroot (skip bootstrap)
+  --include-docs    keep man pages and /usr/share/doc (default: strip)
+  --no-strip        don't strip ELF debug symbols (default: strip)
+  --keep            keep staging directories after build
+
+LOAD_ORDER guide:
+  1-9   kernel/hw      10-19  core libs    20-39  graphics/audio
+  40-59 apps (default) 60-79  desktop      80-99  user layers
+
+Examples:
+  plugin-from-apk vim
+  plugin-from-apk --bundle --name dev-tools git make gcc
+  plugin-from-apk --split python3
+  plugin-from-apk --deps-only firefox
+
+EOF
+    exit 1
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# ARG PARSING
+#───────────────────────────────────────────────────────────────────────────────
+
+[ $# -ge 1 ] || usage
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --bundle)        OPT_MODE="bundle";    shift ;;
+        --split)         OPT_MODE="split";     shift ;;
+        --deps-only)     OPT_DEPS_ONLY=1;      shift ;;
+        --include-docs)  OPT_DOCS=1;           shift ;;
+        --no-strip)      OPT_STRIP=0;          shift ;;
+        --name)          OPT_NAME="$2";        shift 2 ;;
+        --order)         OPT_ORDER="$2";       shift 2 ;;
+        --out)           OPT_OUT="$2";         shift 2 ;;
+        --chroot)        OPT_CHROOT="$2";      shift 2 ;;
+        --keep)          OPT_KEEP=1;           shift ;;
+        --help|-h)       usage ;;
+        --*)             die "unknown option: $1" ;;
+        *)               PACKAGES="$PACKAGES $1"; shift ;;
+    esac
+done
+
+PACKAGES=$(printf '%s' "$PACKAGES" | sed 's/^ //')
+[ -n "$PACKAGES" ] || die "no packages specified"
+
+# Default plugin name = first package
+[ -z "$OPT_NAME" ] && OPT_NAME=$(printf '%s' "$PACKAGES" | awk '{print $1}')
+
+# Override chroot if given
+[ -n "$OPT_CHROOT" ] && CHROOT_DIR="$OPT_CHROOT"
+
+#───────────────────────────────────────────────────────────────────────────────
+# OUTPUT DIRECTORY
+# Prefer /mnt/boot/plugins/available/ (matches plugin-ctl's expected path).
+# Fall back to ./output/plugins/available/ if boot mount isn't up.
+#───────────────────────────────────────────────────────────────────────────────
+
+_resolve_output_dir() {
+    if [ -n "$OPT_OUT" ]; then
+        OUTPUT_DIR="$OPT_OUT"
+        return
+    fi
+
+    # Try reading overlay.env from the running system
+    local env_file="/run/plugin-state/overlay.env"
+    if [ -f "$env_file" ]; then
+        local boot_mount
+        boot_mount=$(grep '^BOOT_MOUNT=' "$env_file" | cut -d= -f2)
+        if [ -n "$boot_mount" ] && [ -d "$boot_mount" ]; then
+            OUTPUT_DIR="${boot_mount}/plugins/available"
+            return
+        fi
+    fi
+
+    # Fallback
+    OUTPUT_DIR="${SCRIPT_DIR}/output/plugins/available"
+    warn "boot mount not found — outputting to $OUTPUT_DIR"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# ALPINE CHROOT BOOTSTRAP
+# Reuse existing chroot from build-base-sfs.sh if present and functional.
+# Otherwise download and bootstrap a fresh one.
+#───────────────────────────────────────────────────────────────────────────────
+
+_chroot_is_functional() {
+    [ -d "$CHROOT_DIR" ] \
+        && [ -x "${CHROOT_DIR}/bin/busybox" ] \
+        && [ -x "${CHROOT_DIR}/sbin/apk" ] \
+        && chroot "$CHROOT_DIR" /bin/sh -c "apk --version" >/dev/null 2>&1
+}
+
+_mount_chroot() {
+    mount -t proc  proc  "${CHROOT_DIR}/proc"  2>/dev/null || true
+    mount --bind   /sys  "${CHROOT_DIR}/sys"   2>/dev/null || true
+    mount --bind   /dev  "${CHROOT_DIR}/dev"   2>/dev/null || true
+    cp /etc/resolv.conf "${CHROOT_DIR}/etc/resolv.conf" 2>/dev/null || true
+}
+
+_umount_chroot() {
+    umount -l "${CHROOT_DIR}/proc" 2>/dev/null || true
+    umount -l "${CHROOT_DIR}/sys"  2>/dev/null || true
+    umount -l "${CHROOT_DIR}/dev"  2>/dev/null || true
+}
+
+bootstrap_chroot() {
+    step "Alpine chroot"
+
+    if _chroot_is_functional; then
+        ok "reusing existing chroot: $CHROOT_DIR"
+        _mount_chroot
+        chroot "$CHROOT_DIR" apk update --quiet 2>/dev/null || true
+        return 0
+    fi
+
+    log "bootstrapping fresh Alpine ${ALPINE_VERSION} chroot"
+    mkdir -p "$BUILD_DIR" "$CHROOT_DIR"
+
+    if [ ! -f "${BUILD_DIR}/${ALPINE_MINIROOTFS}" ]; then
+        log "downloading Alpine minirootfs"
+        wget -q --show-progress \
+            -O "${BUILD_DIR}/${ALPINE_MINIROOTFS}" "$ALPINE_URL" \
+            || die "download failed: $ALPINE_URL"
+    fi
+
+    tar -xzf "${BUILD_DIR}/${ALPINE_MINIROOTFS}" -C "$CHROOT_DIR"
+    _mount_chroot
+    chroot "$CHROOT_DIR" apk update --quiet
+    # Pre-install file — used to inspect which files a package provides
+    chroot "$CHROOT_DIR" apk add --quiet apk-tools
+    ok "chroot ready"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# DEPENDENCY RESOLUTION
+# Uses `apk info --depends` recursively to build a full dep set.
+# Excludes packages in BASE_PROVIDED.
+#───────────────────────────────────────────────────────────────────────────────
+
+_is_base_provided() {
+    local pkg="$1"
+    for base_pkg in $BASE_PROVIDED; do
+        [ "$pkg" = "$base_pkg" ] && return 0
+    done
+    return 1
+}
+
+# Recursively expand deps for a single package.
+# Prints one package name per line (deduped via sort -u).
+# Uses a seen-set via a temp file to prevent infinite loops.
+_expand_deps() {
+    local pkg="$1"
+    local seen_file="$2"
+
+    # Already seen?
+    grep -qx "$pkg" "$seen_file" 2>/dev/null && return 0
+    printf '%s\n' "$pkg" >> "$seen_file"
+
+    # Get direct deps from apk inside chroot
+    local deps
+    deps=$(chroot "$CHROOT_DIR" apk info --depends "$pkg" 2>/dev/null \
+           | grep -v "^${pkg} depends" \
+           | sed 's/[>=<].*//' \
+           | tr ' ' '\n' \
+           | grep -v '^$' \
+           | grep -v '^so:' || true)
+
+    for dep in $deps; do
+        _is_base_provided "$dep" && continue
+        # Check pkg actually exists in Alpine repo before recursing
+        chroot "$CHROOT_DIR" apk info "$dep" >/dev/null 2>&1 \
+            && _expand_deps "$dep" "$seen_file"
+    done
+}
+
+resolve_deps() {
+    local packages="$1"
+    local seen_file
+    seen_file=$(mktemp)
+
+    step "Resolving dependencies"
+    info "requested: $packages"
+
+    for pkg in $packages; do
+        # Verify package exists
+        chroot "$CHROOT_DIR" apk info "$pkg" >/dev/null 2>&1 \
+            || die "package not found in Alpine repo: $pkg"
+        _expand_deps "$pkg" "$seen_file"
+    done
+
+    # Filter out base-provided packages
+    local all_pkgs filtered
+    all_pkgs=$(sort -u "$seen_file")
+
+    for pkg in $all_pkgs; do
+        if _is_base_provided "$pkg"; then
+            dim "  skip (base): $pkg"
+        else
+            filtered="$filtered $pkg"
+            info "  include: $pkg"
+        fi
+    done
+
+    rm -f "$seen_file"
+
+    # Print sorted, trimmed
+    printf '%s' "$filtered" | tr ' ' '\n' | grep -v '^$' | sort -u
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# PACKAGE METADATA
+# Read .PKGINFO from the APK (it's just a gzip'd tar)
+#───────────────────────────────────────────────────────────────────────────────
+
+_pkginfo_field() {
+    local apk_path="$1" field="$2"
+    # APK files are gzip'd tar — .PKGINFO is the first file
+    tar -xzf "$apk_path" -O .PKGINFO 2>/dev/null \
+        | grep "^${field} = " \
+        | head -1 \
+        | sed "s/^${field} = //"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# FETCH APK FILES
+# Downloads .apk files into a work directory using apk fetch.
+# apk fetch respects the installed index — no separate index download needed.
+#───────────────────────────────────────────────────────────────────────────────
+
+fetch_packages() {
+    local pkg_list="$1"
+    local fetch_dir="$2"
+
+    step "Fetching APK files"
+    mkdir -p "$fetch_dir"
+
+    # Copy fetch_dir into chroot so apk can write to it
+    local chroot_fetch="/tmp/apk-fetch-$$"
+    mkdir -p "${CHROOT_DIR}${chroot_fetch}"
+
+    # apk fetch --no-deps because we already resolved deps ourselves
+    for pkg in $pkg_list; do
+        log "  fetch: $pkg"
+        chroot "$CHROOT_DIR" apk fetch \
+            --quiet \
+            --no-deps \
+            --output "${chroot_fetch}" \
+            "$pkg" 2>/dev/null \
+            || warn "fetch failed for $pkg — skipping"
+    done
+
+    # Copy fetched APKs out of chroot
+    cp "${CHROOT_DIR}${chroot_fetch}"/*.apk "$fetch_dir" 2>/dev/null || true
+    rm -rf "${CHROOT_DIR}${chroot_fetch}"
+
+    local count
+    count=$(ls "$fetch_dir"/*.apk 2>/dev/null | wc -l)
+    ok "$count APK file(s) fetched"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# STAGE PACKAGE
+# Extracts an APK into a staging directory, stripping Alpine-specific metadata.
+#───────────────────────────────────────────────────────────────────────────────
+
+stage_apk() {
+    local apk_path="$1"
+    local stage_dir="$2"
+
+    mkdir -p "$stage_dir"
+
+    # Extract everything except Alpine-specific control files
+    tar -xzf "$apk_path" -C "$stage_dir" \
+        --exclude='.PKGINFO' \
+        --exclude='.SIGN.*' \
+        --exclude='.pre-install' \
+        --exclude='.post-install' \
+        --exclude='.pre-deinstall' \
+        --exclude='.post-deinstall' \
+        --exclude='.trigger' \
+        2>/dev/null || warn "extraction warnings for $(basename "$apk_path")"
+
+    # Remove Alpine package manager state that would confuse things
+    rm -rf "${stage_dir}/lib/apk" 2>/dev/null || true
+    rm -rf "${stage_dir}/etc/apk" 2>/dev/null || true
+    rm -rf "${stage_dir}/var/cache/apk" 2>/dev/null || true
+    rm -rf "${stage_dir}/var/lib/apk" 2>/dev/null || true
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# POST-PROCESS STAGING DIR
+# Strip docs, strip ELF debug symbols, remove broken symlinks.
+#───────────────────────────────────────────────────────────────────────────────
+
+post_process() {
+    local stage_dir="$1"
+
+    # ── strip docs ──────────────────────────────────────────────────────────
+    if [ "$OPT_DOCS" = "0" ]; then
+        rm -rf "${stage_dir}/usr/share/doc"  2>/dev/null || true
+        rm -rf "${stage_dir}/usr/share/info" 2>/dev/null || true
+        rm -rf "${stage_dir}/usr/share/gtk-doc" 2>/dev/null || true
+        # Keep man pages unless explicitly stripping — they're small and useful
+        # If you want to strip man too, uncomment:
+        # rm -rf "${stage_dir}/usr/share/man" 2>/dev/null || true
+    fi
+
+    # ── strip ELF debug symbols ─────────────────────────────────────────────
+    if [ "$OPT_STRIP" = "1" ] && command -v strip >/dev/null 2>&1; then
+        find "$stage_dir" -type f | while read -r f; do
+            # Only strip ELF files — check magic bytes
+            local magic
+            magic=$(head -c 4 "$f" 2>/dev/null | od -A n -t x1 | tr -d ' ')
+            case "$magic" in
+                7f454c46*) strip --strip-unneeded "$f" 2>/dev/null || true ;;
+            esac
+        done
+        info "ELF debug symbols stripped"
+    fi
+
+    # ── remove broken symlinks ───────────────────────────────────────────────
+    find "$stage_dir" -type l | while read -r link; do
+        [ -e "$link" ] || {
+            warn "removing broken symlink: ${link#${stage_dir}}"
+            rm -f "$link"
+        }
+    done
+
+    # ── remove empty directories ─────────────────────────────────────────────
+    find "$stage_dir" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# WRITE MANIFEST INTO STAGING DIR
+#───────────────────────────────────────────────────────────────────────────────
+
+write_manifest() {
+    local stage_dir="$1"
+    local plugin_name="$2"
+    local plugin_version="$3"
+    local plugin_desc="$4"
+    local plugin_depends="$5"   # space-separated FrugalOS plugin names
+
+    mkdir -p "${stage_dir}/.plugin"
+
+    cat > "${stage_dir}/.plugin/manifest" <<EOF
+NAME="${plugin_name}"
+VERSION="${plugin_version}"
+DESCRIPTION="${plugin_desc}"
+ARCH="x86_64"
+DEPENDS="${plugin_depends}"
+CONFLICTS=""
+PROVIDES=""
+LOAD_ORDER=${OPT_ORDER}
+HOOK_LOAD="/.plugin/on_load"
+HOOK_UNLOAD="/.plugin/on_unload"
+EOF
+
+    # Minimal no-op hooks (plugin-ctl will try to run them)
+    printf '#!/bin/sh\nexit 0\n' > "${stage_dir}/.plugin/on_load"
+    printf '#!/bin/sh\nexit 0\n' > "${stage_dir}/.plugin/on_unload"
+    chmod 755 "${stage_dir}/.plugin/on_load"
+    chmod 755 "${stage_dir}/.plugin/on_unload"
+
+    # Module list (empty by default — package installs don't typically need this)
+    printf '# Kernel modules to load with this plugin (one per line)\n' \
+        > "${stage_dir}/.plugin/modules"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# BUILD .SFS FROM STAGING DIR
+#───────────────────────────────────────────────────────────────────────────────
+
+build_sfs() {
+    local stage_dir="$1"
+    local out_name="$2"
+    local out_path="${OUTPUT_DIR}/${out_name}.sfs"
+
+    mkdir -p "$OUTPUT_DIR"
+
+    log "mksquashfs → $out_path"
+
+    mksquashfs "$stage_dir" "$out_path" \
+        -comp xz -Xbcj x86 \
+        -noappend \
+        -no-exports \
+        -no-progress \
+        2>&1 | while IFS= read -r line; do info "  $line"; done
+
+    [ -f "$out_path" ] || die "mksquashfs produced no output: $out_path"
+
+    local size
+    size=$(du -sh "$out_path" | cut -f1)
+    ok "${out_name}.sfs built ($size)"
+    printf '%s' "$out_path"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# BUNDLE MODE
+# All packages + deps → one .sfs named $OPT_NAME
+#───────────────────────────────────────────────────────────────────────────────
+
+build_bundle() {
+    local pkg_list="$1"
+    local stage_dir="${BUILD_DIR}/plugin-stage-${OPT_NAME}"
+    local fetch_dir="${BUILD_DIR}/apk-fetch-${OPT_NAME}"
+
+    step "Bundle mode: → ${OPT_NAME}.sfs"
+
+    fetch_packages "$pkg_list" "$fetch_dir"
+
+    step "Staging files"
+    rm -rf "$stage_dir"
+    mkdir -p "$stage_dir"
+
+    # Extract each APK into the combined stage dir
+    for apk in "${fetch_dir}"/*.apk; do
+        [ -f "$apk" ] || continue
+        local pkgname
+        pkgname=$(_pkginfo_field "$apk" "pkgname")
+        info "  extracting: $pkgname"
+        stage_apk "$apk" "$stage_dir"
+    done
+
+    post_process "$stage_dir"
+
+    # Get version + description from the primary package's APK
+    local primary_pkg
+    primary_pkg=$(printf '%s' "$PACKAGES" | awk '{print $1}')
+    local primary_apk
+    primary_apk=$(ls "${fetch_dir}/${primary_pkg}"*.apk 2>/dev/null | head -1 || true)
+
+    local version desc
+    if [ -f "$primary_apk" ]; then
+        version=$(_pkginfo_field "$primary_apk" "pkgver")
+        desc=$(_pkginfo_field "$primary_apk" "pkgdesc")
+    fi
+    version="${version:-unknown}"
+    desc="${desc:-Built from Alpine APK: $PACKAGES}"
+
+    write_manifest "$stage_dir" "$OPT_NAME" "$version" "$desc" ""
+
+    build_sfs "$stage_dir" "$OPT_NAME"
+
+    [ "$OPT_KEEP" = "0" ] && rm -rf "$stage_dir" "$fetch_dir" || true
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# SPLIT MODE
+# One .sfs per package. Sets DEPENDS between them using FrugalOS plugin names.
+# Each plugin name is the APK package name (safe, since APK names are clean).
+#───────────────────────────────────────────────────────────────────────────────
+
+build_split() {
+    local pkg_list="$1"
+    local fetch_dir="${BUILD_DIR}/apk-fetch-split-$$"
+
+    step "Split mode: one .sfs per package"
+
+    fetch_packages "$pkg_list" "$fetch_dir"
+
+    # Process each package individually
+    for apk in "${fetch_dir}"/*.apk; do
+        [ -f "$apk" ] || continue
+
+        local pkgname pkgver pkgdesc apk_deps
+        pkgname=$(_pkginfo_field "$apk" "pkgname")
+        pkgver=$(_pkginfo_field "$apk" "pkgver")
+        pkgdesc=$(_pkginfo_field "$apk" "pkgdesc")
+
+        step "  → ${pkgname}.sfs"
+
+        local stage_dir="${BUILD_DIR}/plugin-stage-${pkgname}-$$"
+        rm -rf "$stage_dir"
+        mkdir -p "$stage_dir"
+
+        stage_apk "$apk" "$stage_dir"
+        post_process "$stage_dir"
+
+        # Build DEPENDS: direct Alpine deps that are in our pkg_list
+        # (base-provided ones already filtered from pkg_list)
+        local frugal_deps=""
+        local raw_deps
+        raw_deps=$(tar -xzf "$apk" -O .PKGINFO 2>/dev/null \
+                   | grep "^depend = " \
+                   | sed 's/^depend = //' \
+                   | sed 's/[>=<].*//' \
+                   | grep -v '^so:' \
+                   || true)
+        for dep in $raw_deps; do
+            # Only include as DEPENDS if dep is in our built set
+            echo "$pkg_list" | grep -qw "$dep" \
+                && frugal_deps="${frugal_deps} ${dep}"
+        done
+        frugal_deps=$(printf '%s' "$frugal_deps" | sed 's/^ //')
+
+        write_manifest "$stage_dir" "$pkgname" "$pkgver" "${pkgdesc:-Alpine: $pkgname}" "$frugal_deps"
+        build_sfs "$stage_dir" "$pkgname"
+
+        [ "$OPT_KEEP" = "0" ] && rm -rf "$stage_dir" || true
+    done
+
+    [ "$OPT_KEEP" = "0" ] && rm -rf "$fetch_dir" || true
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# PRINT DEP TREE (--deps-only)
+#───────────────────────────────────────────────────────────────────────────────
+
+print_dep_tree() {
+    local packages="$1"
+
+    step "Dependency tree for: $packages"
+    printf '\n'
+
+    local seen_file
+    seen_file=$(mktemp)
+
+    _print_tree() {
+        local pkg="$1"
+        local depth="$2"
+
+        grep -qx "$pkg" "$seen_file" 2>/dev/null && {
+            printf '%s%s (already listed)\n' "$(printf '%*s' $((depth*2)) '')" "$pkg"
+            return
+        }
+        printf '%s\n' "$pkg" >> "$seen_file"
+
+        local prefix
+        prefix=$(printf '%*s' $((depth*2)) '')
+
+        if _is_base_provided "$pkg"; then
+            printf '%s\033[0;37m%s [base]\033[0m\n' "$prefix" "$pkg"
+            return
+        fi
+
+        printf '%s\033[1;32m%s\033[0m\n' "$prefix" "$pkg"
+
+        local deps
+        deps=$(chroot "$CHROOT_DIR" apk info --depends "$pkg" 2>/dev/null \
+               | grep -v "^${pkg} depends" \
+               | sed 's/[>=<].*//' \
+               | tr ' ' '\n' \
+               | grep -v '^$' \
+               | grep -v '^so:' || true)
+
+        for dep in $deps; do
+            _print_tree "$dep" $((depth+1))
+        done
+    }
+
+    for pkg in $packages; do
+        _print_tree "$pkg" 0
+    done
+
+    rm -f "$seen_file"
+    printf '\n'
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# PREFLIGHT
+#───────────────────────────────────────────────────────────────────────────────
+
+preflight() {
+    step "Preflight"
+
+    [ "$(id -u)" = "0" ] \
+        || die "must run as root (needs chroot, mount)"
+
+    for cmd in wget tar cpio gzip mksquashfs; do
+        command -v "$cmd" >/dev/null 2>&1 && ok "$cmd" \
+            || die "required tool not found: $cmd"
+    done
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# CLEANUP
+#───────────────────────────────────────────────────────────────────────────────
+
+cleanup() {
+    _umount_chroot 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+#───────────────────────────────────────────────────────────────────────────────
+# MAIN
+#───────────────────────────────────────────────────────────────────────────────
+
+printf '\n'
+printf '\033[1;37m═══════════════════════════════════════════════\033[0m\n'
+printf '\033[1;37m  FrugalOS plugin-from-apk\033[0m\n'
+printf '\033[1;37m  packages: %s\033[0m\n' "$PACKAGES"
+printf '\033[1;37m  mode:     %s\033[0m\n' "$OPT_MODE"
+printf '\033[1;37m═══════════════════════════════════════════════\033[0m\n\n'
+
+preflight
+_resolve_output_dir
+bootstrap_chroot
+
+# Resolve full dep list
+RESOLVED_PKGS=$(resolve_deps "$PACKAGES")
+
+if [ "$OPT_DEPS_ONLY" = "1" ]; then
+    print_dep_tree "$PACKAGES"
+    printf 'Resolved package list (excluding base):\n\n'
+    printf '  %s\n' $RESOLVED_PKGS
+    printf '\n'
+    exit 0
+fi
+
+case "$OPT_MODE" in
+    bundle) build_bundle "$RESOLVED_PKGS" ;;
+    split)  build_split  "$RESOLVED_PKGS" ;;
+    *)      die "unknown mode: $OPT_MODE" ;;
+esac
+
+printf '\n'
+printf '\033[1;32mDone.\033[0m Output: %s\n\n' "$OUTPUT_DIR"
+info "Next:"
+info "  plugin-ctl verify $OPT_NAME"
+info "  plugin-ctl enable $OPT_NAME   # boot autoload"
+info "  plugin-ctl load   $OPT_NAME   # hot-load now"
+printf '\n'

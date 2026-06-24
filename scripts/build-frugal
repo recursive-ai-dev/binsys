@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# binsys build-frugal — interactive frugal overlay system builder
+# Walks you through creating a Puppy-style frugal system with optional
+# kernel, initrd, ESP, bootloader, and encryption.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+
+require_binsys
+
+header "Build Frugal Overlay System"
+echo " This creates a base.sfs (squashfs) + save.img (ext4) overlay system."
+
+# ── step 1: system name ───────────────────────────────────────────────────────
+name=$(prompt "System name" "myfrugal")
+name="${name// /_}"
+
+if binsys info "$name" &>/dev/null; then
+    die "System '$name' already exists"
+fi
+
+# ── step 2: base source ───────────────────────────────────────────────────────
+echo -e "\n ${DIM}Base source: where does the read-only data come from?${RST}"
+src_type=$(select_one "Base source type" \
+    "empty (start fresh)" \
+    "ISO file (extract to squashfs)" \
+    "directory (snapshot to squashfs)" \
+    "existing squashfs file")
+
+base_src=""
+case "$src_type" in
+    "empty (start fresh)")
+        info "An empty base will be created — you can populate it later."
+        ;;
+    "ISO file (extract to squashfs)")
+        base_src=$(prompt "Path to ISO file" "")
+        [[ -f "$base_src" ]] || die "File not found: $base_src"
+        ;;
+    "directory (snapshot to squashfs)")
+        base_src=$(prompt "Path to directory" "/")
+        [[ -d "$base_src" ]] || die "Directory not found: $base_src"
+        ;;
+    "existing squashfs file")
+        base_src=$(prompt "Path to .sfs file" "")
+        [[ -f "$base_src" ]] || die "File not found: $base_src"
+        ;;
+esac
+
+# ── step 3: sizes ─────────────────────────────────────────────────────────────
+size=$(prompt "Save layer size (the writable overlay)" "2G")
+save_size=$(prompt "Save image size (can differ from total)" "$size")
+
+# ── step 4: boot components ───────────────────────────────────────────────────
+echo ""
+if confirm "Include a bootloader (StringsBoot UEFI)?" "y"; then
+    bootloader="--bootloader"
+    if confirm "Create an isolated ESP image?" "y"; then
+        auto_esp="--auto-esp"
+        kernel=$(prompt "Path to kernel (vmlinuz)" "")
+        [[ -n "$kernel" && -f "$kernel" ]] || die "Kernel not found or not specified"
+        initrd=$(prompt "Path to initrd (optional)" "") || true
+        esp_size=$(prompt "ESP size" "256M")
+    else
+        auto_esp=""
+        kernel=""
+        initrd=""
+        esp_size=""
+    fi
+else
+    bootloader=""
+    auto_esp=""
+    kernel=""
+    initrd=""
+    esp_size=""
+fi
+
+# ── step 5: encryption ────────────────────────────────────────────────────────
+encrypt=""
+if confirm "Encrypt the save layer with LUKS2?" "n"; then
+    encrypt="--encrypt"
+fi
+
+# ── step 6: review ─────────────────────────────────────────────────────────────
+header "Review"
+echo "  Name:       $name"
+echo "  Base:       ${base_src:-empty}"
+echo "  Size:       $size (save: $save_size)"
+echo "  Bootloader: ${bootloader:-no}"
+echo "  Auto ESP:   ${auto_esp:-no}"
+echo "  Kernel:     ${kernel:-none}"
+echo "  Initrd:     ${initrd:-none}"
+echo "  Encrypt:    ${encrypt:-no}"
+echo ""
+
+if ! confirm "Create this system?" "Y"; then
+    die "Cancelled."
+fi
+
+# ── step 7: build ──────────────────────────────────────────────────────────────
+header "Building"
+
+# Create the frugal system
+if [[ -n "$base_src" ]]; then
+    info "Creating frugal system from: $base_src"
+    if [[ "$src_type" == "directory (snapshot to squashfs)" ]]; then
+        run_with_spinner "Snapshotting directory..." \
+            binsys snap "$base_src" --output "$name"
+        info "Snapshot saved. Converting to frugal..."
+        run_with_spinner "Converting to frugal..." \
+            binsys new "$name" --type frugal --from "$(binsys info "$name" --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('base','base.sfs'))" 2>/dev/null || echo '')"
+    else
+        binsys new "$name" --type frugal --size "$size" \
+            --save-size "$save_size" \
+            ${bootloader:+--bootloader} \
+            ${auto_esp:+--auto-esp} \
+            ${kernel:+--boot-kernel "$kernel"} \
+            ${encrypt:+--encrypt} \
+            --from "${base_src:-}" 2>&1
+    fi
+else
+    info "Creating empty frugal system..."
+    binsys new "$name" --type frugal --size "$size" \
+        --save-size "$save_size" \
+        ${bootloader:+--bootloader} \
+        ${auto_esp:+--auto-esp} \
+        ${kernel:+--boot-kernel "$kernel"} \
+        ${encrypt:+--encrypt} 2>&1
+fi
+
+# Handle initrd separately if provided
+if [[ -n "${initrd:-}" && -f "${initrd:-}" ]] && binsys info "$name" &>/dev/null; then
+    meta=$(binsys info "$name" --json 2>/dev/null)
+    esp=$(echo "$meta" | python3 -c "import json,sys; print(json.load(sys.stdin).get('esp',''))" 2>/dev/null)
+    if [[ -n "$esp" ]]; then
+        sysdir=$(binsys info "$name" --json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('name',''))" 2>/dev/null)
+        run_with_spinner "Copying initrd into ESP..." \
+            mcopy -i "$HOME/.binsys/images/$name/$esp" "$initrd" "::/initrd.img" 2>/dev/null || \
+            warn "Could not copy initrd into ESP (needs mtools)"
+    fi
+fi
+
+echo ""
+ok "Frugal system '$name' created!"
+sub "  binsys run $name --mode vm"
+sub "  binsys run $name --mode container"
+sub "  binsys run $name --uefi --kernel $kernel"  # only if kernel was provided
+echo ""
+sub "Frugal management:"
+sub "  binsys frugal snapshot $name [--label mylabel]"
+sub "  binsys frugal merge $name"
+sub "  binsys frugal list $name"
+done_msg

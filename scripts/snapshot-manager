@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# binsys snapshot-manager — interactive save-layer snapshot manager
+# Manages frugal save.img snapshots: create, list, rollback, merge.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+
+require_binsys
+
+header "Frugal Snapshot Manager"
+
+# ── pick system ────────────────────────────────────────────────────────────────
+echo " Frugal systems:"
+binsys list --json 2>/dev/null | python3 -c "
+import json, sys
+for m in json.load(sys.stdin):
+    if m.get('frugal'):
+        badges = 'M' if m.get('mounted') else ''
+        print(f\"  {m['name']:<22}  {m.get('size','?'):<8}  {badges}\")
+" 2>/dev/null || echo "  (no frugal systems found)"
+echo ""
+
+name=$(prompt "Frugal system name" "")
+[[ -n "$name" ]] || die "No name given"
+meta=$(binsys info "$name" --json 2>/dev/null) || die "System '$name' not found"
+is_frugal=$(echo "$meta" | python3 -c "import json,sys; print(json.load(sys.stdin).get('frugal', False))" 2>/dev/null)
+[[ "$is_frugal" == "True" ]] || die "System '$name' is not frugal"
+
+# ── menu ───────────────────────────────────────────────────────────────────────
+while true; do
+    header "Frugal: ${name}"
+    echo " 1) Snapshot save layer"
+    echo " 2) List snapshots"
+    echo " 3) Rollback to snapshot"
+    echo " 4) Merge save → base (flatten overlay)"
+    echo " 5) Show disk usage"
+    echo " 6) Quit"
+    echo ""
+    choice=$(prompt "Choose" "1")
+
+    case "$choice" in
+        1)
+            label=$(prompt "Snapshot label (optional)" "")
+            run_with_spinner "Creating snapshot..." \
+                binsys frugal snapshot "$name" ${label:+--label "$label"}
+            ok "Snapshot created"
+            ;;
+        2)
+            header "Snapshots for ${name}"
+            snaps=$(binsys frugal list "$name" 2>/dev/null)
+            if [[ -z "$snaps" || "$snaps" == "No save snapshots for"* ]]; then
+                warn "No snapshots yet for '$name'"
+            else
+                echo "$snaps"
+            fi
+            echo ""
+            prompt "Press Enter to continue" "" >/dev/null
+            ;;
+        3)
+            header "Available snapshots"
+            binsys frugal list "$name" 2>/dev/null || true
+            echo ""
+            snap=$(prompt "Snapshot file name to restore" "")
+            if confirm "Rollback save.img to '${snap}'?" "n"; then
+                if confirm "This overwrites save.img. Are you sure?" "n"; then
+                    run_with_spinner "Rolling back..." \
+                        binsys frugal rollback "$name" "$snap"
+                    ok "Rolled back to: $snap"
+                fi
+            fi
+            ;;
+        4)
+            warn "Merging save → base flattens the overlay."
+            warn "Current save data becomes read-only in base.sfs."
+            warn "The save layer will be reset to empty."
+            echo ""
+            if confirm "Merge save.img into base.sfs?" "n"; then
+                if confirm "Are you ABSOLUTELY sure?" "n"; then
+                    run_with_spinner "Merging overlay..." \
+                        binsys frugal merge "$name"
+                    ok "Overlay flattened — save data is now in base.sfs"
+                fi
+            fi
+            ;;
+        5)
+            header "Disk Usage: ${name}"
+            binsys info "$name" 2>/dev/null | tail -n +3 || true
+            echo ""
+            prompt "Press Enter to continue" "" >/dev/null
+            ;;
+        6|q|Q)
+            ok "Goodbye."
+            exit 0
+            ;;
+    esac
+done

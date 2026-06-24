@@ -1,0 +1,39 @@
+[package]
+name        = "puppyboot"
+version     = "1.0.0"
+edition     = "2021"
+description = "PuppyBoot V1 — UEFI boot manager for AIOS / Linux / chainload"
+authors     = ["James (AIOS project)"]
+license     = "Proprietary"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Dependencies — only uefi crate (project policy: minimize external surface)
+# ════════════════════════════════════════════════════════════════════════════
+[dependencies]
+uefi = { version = "0.28", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
+log  = { version = "0.4",  default-features = false }
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Release profile — size-optimized PE/COFF for the ESP
+#    opt-level = "s"  → reduce code size (BOOTX64.EFI typically <200 KiB)
+#    lto       = fat  → cross-crate inlining
+#    panic     = abort → no unwind tables (no panic= "unwind" in UEFI)
+# ════════════════════════════════════════════════════════════════════════════
+[profile.release]
+opt-level        = "s"
+lto              = "fat"
+codegen-units    = 1
+panic            = "abort"
+strip            = "symbols"
+debug            = false
+overflow-checks  = true   # essential for partition tables, integer math
+incremental      = false
+
+[profile.dev]
+opt-level        = 1
+panic            = "abort"
+overflow-checks  = true
+
+[[bin]]
+name = "puppyboot"
+path = "src/main.rs"

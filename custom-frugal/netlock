@@ -1,0 +1,943 @@
+#!/bin/sh
+#═══════════════════════════════════════════════════════════════════════════════
+#  /usr/bin/netlock — FrugalOS Network Isolation Manager
+#
+#  Implements four progressive isolation levels:
+#
+#   UNLOCKED   — baseline, no restrictions
+#   FIREWALLED — nftables DROP-all on external interfaces (lo untouched)
+#   ISOLATED   — FIREWALLED + all external interfaces administratively DOWN
+#   AIRGAPPED  — ISOLATED + network kernel modules removed from RAM
+#
+#  Each level is a strict superset of the one below.
+#  Disengage walks levels back toward UNLOCKED one step at a time.
+#  State is saved to /run/netlock/ (tmpfs — resets at boot, which is correct).
+#  Persist isolation across reboots via /etc/frugalos/netlock.conf.
+#
+#  Usage:
+#    netlock                         show status
+#    netlock status                  show status (verbose)
+#    netlock engage [--level N]      engage isolation (default: ISOLATED)
+#    netlock disengage [--confirm]   walk back one level
+#    netlock airgap                  shorthand for engage --level 3
+#    netlock allow <iface>           whitelist interface in FIREWALLED level
+#    netlock deny  <iface>           remove interface from whitelist
+#    netlock list-interfaces         show all network interfaces + state
+#
+#  Boot integration:
+#    Set ENGAGE_ON_BOOT=1 and BOOT_LEVEL=2 in /etc/frugalos/netlock.conf
+#    The sysinit hook /etc/frugalos/init.d/sysinit.d/10-netlock.sh reads it.
+#
+#  Tool detection (graceful degradation):
+#    nft available    → full nftables firewall rules
+#    iptables avail.  → iptables fallback rules
+#    neither avail.   → interface management only (still effective for AIRGAPPED)
+#═══════════════════════════════════════════════════════════════════════════════
+
+set -e
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export PATH
+
+#───────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+#───────────────────────────────────────────────────────────────────────────────
+
+NETLOCK_DIR="/run/netlock"
+STATE_FILE="${NETLOCK_DIR}/state"
+IFACE_SAVE="${NETLOCK_DIR}/ifaces-saved"
+ROUTE_SAVE="${NETLOCK_DIR}/routes-saved"
+NFT_SAVE="${NETLOCK_DIR}/nft-saved.conf"
+MOD_SAVE="${NETLOCK_DIR}/modules-removed"
+ALLOW_FILE="${NETLOCK_DIR}/allowed-ifaces"
+CONFIG_FILE="/etc/frugalos/netlock.conf"
+
+# Levels
+LEVEL_UNLOCKED=0
+LEVEL_FIREWALLED=1
+LEVEL_ISOLATED=2
+LEVEL_AIRGAPPED=3
+
+LEVEL_NAMES="UNLOCKED FIREWALLED ISOLATED AIRGAPPED"
+
+# nftables table name — uses priority -200 so it runs before any user tables
+NFT_TABLE="netlock"
+
+#───────────────────────────────────────────────────────────────────────────────
+# COLOUR + LOGGING
+#───────────────────────────────────────────────────────────────────────────────
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+    C_RED='\033[1;31m'; C_GRN='\033[1;32m'; C_YEL='\033[1;33m'
+    C_BLU='\033[1;34m'; C_CYN='\033[1;36m'; C_WHT='\033[1;37m'
+    C_DIM='\033[0;37m'; C_RST='\033[0m'
+else
+    C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_WHT=''; C_DIM=''; C_RST=''
+fi
+
+log()  { printf "${C_GRN}=>${C_RST} %s\n" "$*"; }
+info() { printf "   %s\n" "$*"; }
+warn() { printf "${C_YEL}  warn:${C_RST} %s\n" "$*" >&2; }
+die()  { printf "${C_RED}  error:${C_RST} %s\n" "$*" >&2; exit 1; }
+ok()   { printf "${C_GRN}  ✓${C_RST} %s\n" "$*"; }
+fail() { printf "${C_RED}  ✗${C_RST} %s\n" "$*" >&2; }
+step() { printf '\n%s─────────────────────────────────────────%s\n' "$C_WHT" "$C_RST"; }
+
+#───────────────────────────────────────────────────────────────────────────────
+# ROOT CHECK
+#───────────────────────────────────────────────────────────────────────────────
+
+_require_root() {
+    [ "$(id -u)" = "0" ] || die "netlock requires root"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# STATE MANAGEMENT
+#───────────────────────────────────────────────────────────────────────────────
+
+_init_state_dir() {
+    mkdir -p "$NETLOCK_DIR"
+    chmod 700 "$NETLOCK_DIR"
+}
+
+_read_state() {
+    [ -f "$STATE_FILE" ] || { printf '%d' "$LEVEL_UNLOCKED"; return; }
+    cat "$STATE_FILE"
+}
+
+_write_state() {
+    local level="$1"
+    _init_state_dir
+    printf '%d' "$level" > "$STATE_FILE"
+}
+
+_level_name() {
+    local level="$1"
+    case "$level" in
+        0) printf 'UNLOCKED'    ;;
+        1) printf 'FIREWALLED'  ;;
+        2) printf 'ISOLATED'    ;;
+        3) printf 'AIRGAPPED'   ;;
+        *) printf 'UNKNOWN(%s)' "$level" ;;
+    esac
+}
+
+_level_colour() {
+    local level="$1"
+    case "$level" in
+        0) printf '%s' "$C_GRN" ;;
+        1) printf '%s' "$C_YEL" ;;
+        2) printf '%s' "$C_RED" ;;
+        3) printf '%s' "$C_RED" ;;
+    esac
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# TOOL DETECTION
+# We detect what firewall tools are available and use the best one.
+# Both can coexist — we use nft preferentially.
+#───────────────────────────────────────────────────────────────────────────────
+
+_has_nft()      { command -v nft      >/dev/null 2>&1; }
+_has_iptables() { command -v iptables >/dev/null 2>&1; }
+_has_ip()       { command -v ip       >/dev/null 2>&1; }
+_has_ifconfig() { command -v ifconfig >/dev/null 2>&1; }
+_has_modprobe() { command -v modprobe >/dev/null 2>&1; }
+
+_fw_tool() {
+    _has_nft      && { printf 'nft';      return; }
+    _has_iptables && { printf 'iptables'; return; }
+    printf 'none'
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# INTERFACE ENUMERATION
+# Returns all non-loopback, non-virtual interfaces.
+# We use /sys/class/net to enumerate — works without iproute2.
+#───────────────────────────────────────────────────────────────────────────────
+
+_get_external_ifaces() {
+    local iface
+    for iface in /sys/class/net/*; do
+        iface=$(basename "$iface")
+        [ "$iface" = "lo" ] && continue
+
+        # Skip virtual interfaces we don't want to touch
+        case "$iface" in
+            dummy*|sit*|gre*|ip6tnl*|ip6gre*) continue ;;
+        esac
+
+        # Skip tap/tun created by VMs — they belong to user plugins
+        [ -d "/sys/class/net/${iface}/tun_flags" ] && continue
+
+        printf '%s\n' "$iface"
+    done
+}
+
+_iface_is_up() {
+    local iface="$1"
+    local state
+    state=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || printf 'unknown')
+    [ "$state" = "up" ] && return 0
+
+    # Also check flags — UP flag is bit 0 of /sys/class/net/X/flags
+    local flags
+    flags=$(cat "/sys/class/net/${iface}/flags" 2>/dev/null || printf '0x0')
+    # 0x1 = IFF_UP
+    printf '%d' "$((flags & 0x1))" | grep -q '^1$'
+}
+
+_iface_down() {
+    local iface="$1"
+    if _has_ip; then
+        ip link set "$iface" down 2>/dev/null && return 0
+    fi
+    if _has_ifconfig; then
+        ifconfig "$iface" down 2>/dev/null && return 0
+    fi
+    # Sysfs fallback
+    printf '0' > "/sys/class/net/${iface}/flags" 2>/dev/null || true
+}
+
+_iface_up() {
+    local iface="$1"
+    if _has_ip; then
+        ip link set "$iface" up 2>/dev/null && return 0
+    fi
+    if _has_ifconfig; then
+        ifconfig "$iface" up 2>/dev/null && return 0
+    fi
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# STATE PRESERVATION
+# Before modifying any interface or routing state, we save it.
+# This allows disengage to restore exactly what was there before.
+#───────────────────────────────────────────────────────────────────────────────
+
+_save_iface_states() {
+    _init_state_dir
+    : > "$IFACE_SAVE"
+
+    local iface
+    for iface in $(_get_external_ifaces); do
+        local up=0
+        _iface_is_up "$iface" && up=1
+        printf '%s %d\n' "$iface" "$up" >> "$IFACE_SAVE"
+    done
+
+    # Save routing table
+    if _has_ip; then
+        ip route show table all 2>/dev/null > "$ROUTE_SAVE" || true
+        ip -6 route show table all 2>/dev/null >> "$ROUTE_SAVE" || true
+    fi
+
+    ok "interface states saved ($(wc -l < "$IFACE_SAVE") interfaces)"
+}
+
+_restore_iface_states() {
+    [ -f "$IFACE_SAVE" ] || { warn "no saved interface state — cannot restore"; return 1; }
+
+    while IFS=' ' read -r iface was_up; do
+        [ -z "$iface" ] && continue
+        [ -d "/sys/class/net/${iface}" ] || { warn "interface $iface no longer exists"; continue; }
+
+        if [ "$was_up" = "1" ]; then
+            _iface_up "$iface" && ok "restored UP: $iface" || warn "could not bring up $iface"
+        else
+            info "  left DOWN: $iface (was already down before isolation)"
+        fi
+    done < "$IFACE_SAVE"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# FIREWALL LAYER — nftables
+#───────────────────────────────────────────────────────────────────────────────
+
+_nft_load_drop_all() {
+    # Save current ruleset before overriding
+    nft list ruleset 2>/dev/null > "$NFT_SAVE" || true
+
+    # Load allowed interfaces from whitelist file
+    local allowed_set=""
+    if [ -s "$ALLOW_FILE" ]; then
+        allowed_set=$(tr '\n' ',' < "$ALLOW_FILE" | sed 's/,$//')
+    fi
+
+    # Build the ruleset
+    local accept_allowed=""
+    [ -n "$allowed_set" ] && accept_allowed="
+        iif { ${allowed_set} } accept comment \"whitelisted\""
+
+    nft -f - <<NFTRULES
+# netlock DROP-all ruleset
+# Priority -200 ensures this runs before any user or plugin rules
+# The only way to override this is to flush this table explicitly.
+
+table inet ${NFT_TABLE} {
+
+    chain input {
+        type filter hook input priority -200; policy drop;
+
+        # Loopback is unconditionally allowed — removing it would
+        # break Unix socket fallback and 127.0.0.1 IPC.
+        iif lo accept comment "loopback unrestricted"
+
+        # Established/related: dropped at AIRGAPPED (no external ifaces anyway)
+        # Allowed at FIREWALLED to not break existing sessions mid-engage
+        ct state established,related accept comment "existing sessions"
+${accept_allowed}
+
+        # Log and drop everything else
+        log prefix "netlock DROP IN: " level warn
+        drop
+    }
+
+    chain output {
+        type filter hook output priority -200; policy drop;
+
+        oif lo accept comment "loopback unrestricted"
+        ct state established,related accept
+${accept_allowed}
+
+        log prefix "netlock DROP OUT: " level warn
+        drop
+    }
+
+    chain forward {
+        type filter hook forward priority -200; policy drop;
+        log prefix "netlock DROP FWD: " level warn
+        drop
+    }
+}
+NFTRULES
+
+    ok "nftables DROP-all ruleset loaded (table: ${NFT_TABLE})"
+}
+
+_nft_flush() {
+    nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+
+    # Restore previous ruleset if we saved one
+    if [ -s "$NFT_SAVE" ]; then
+        nft -f "$NFT_SAVE" 2>/dev/null && ok "nftables ruleset restored" \
+            || warn "could not restore saved nftables ruleset — flushed to empty"
+    else
+        ok "nftables ${NFT_TABLE} table removed"
+    fi
+}
+
+_nft_add_allow() {
+    local iface="$1"
+    nft add element inet "${NFT_TABLE}" allowed_ifaces "{ ${iface} }" 2>/dev/null || {
+        # Reload rules with updated whitelist
+        _nft_load_drop_all
+    }
+}
+
+_nft_remove_allow() {
+    local iface="$1"
+    nft delete element inet "${NFT_TABLE}" allowed_ifaces "{ ${iface} }" 2>/dev/null || {
+        _nft_load_drop_all
+    }
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# FIREWALL LAYER — iptables fallback
+#───────────────────────────────────────────────────────────────────────────────
+
+_ipt_save() {
+    iptables-save 2>/dev/null > "${NETLOCK_DIR}/iptables-saved" || true
+    ip6tables-save 2>/dev/null >> "${NETLOCK_DIR}/iptables-saved" || true
+}
+
+_ipt_load_drop_all() {
+    _ipt_save
+
+    # Flush existing rules
+    iptables -F 2>/dev/null; iptables -X 2>/dev/null; iptables -Z 2>/dev/null || true
+    ip6tables -F 2>/dev/null; ip6tables -X 2>/dev/null || true
+
+    # Set DROP policies
+    for chain in INPUT OUTPUT FORWARD; do
+        iptables -P "$chain" DROP 2>/dev/null || true
+        ip6tables -P "$chain" DROP 2>/dev/null || true
+    done
+
+    # Allow loopback
+    iptables  -A INPUT  -i lo -j ACCEPT 2>/dev/null || true
+    iptables  -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+    ip6tables -A INPUT  -i lo -j ACCEPT 2>/dev/null || true
+    ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+
+    # Allow established/related
+    iptables  -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables  -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    ip6tables -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+
+    # Whitelisted interfaces
+    if [ -s "$ALLOW_FILE" ]; then
+        while IFS= read -r iface; do
+            iptables  -A INPUT  -i "$iface" -j ACCEPT 2>/dev/null || true
+            iptables  -A OUTPUT -o "$iface" -j ACCEPT 2>/dev/null || true
+            ip6tables -A INPUT  -i "$iface" -j ACCEPT 2>/dev/null || true
+            ip6tables -A OUTPUT -o "$iface" -j ACCEPT 2>/dev/null || true
+        done < "$ALLOW_FILE"
+    fi
+
+    ok "iptables DROP-all rules loaded"
+}
+
+_ipt_flush() {
+    if [ -f "${NETLOCK_DIR}/iptables-saved" ]; then
+        iptables-restore  < "${NETLOCK_DIR}/iptables-saved" 2>/dev/null || true
+        ip6tables-restore < "${NETLOCK_DIR}/iptables-saved" 2>/dev/null || true
+        ok "iptables rules restored"
+    else
+        # Restore ACCEPT policies and flush
+        for chain in INPUT OUTPUT FORWARD; do
+            iptables  -P "$chain" ACCEPT 2>/dev/null || true
+            ip6tables -P "$chain" ACCEPT 2>/dev/null || true
+        done
+        iptables  -F 2>/dev/null || true
+        ip6tables -F 2>/dev/null || true
+        ok "iptables flushed to ACCEPT-all"
+    fi
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# FIREWALL DISPATCH
+# Calls the right backend based on what's available.
+#───────────────────────────────────────────────────────────────────────────────
+
+_fw_engage() {
+    local fw
+    fw=$(_fw_tool)
+    case "$fw" in
+        nft)       _nft_load_drop_all ;;
+        iptables)  _ipt_load_drop_all ;;
+        none)
+            warn "no firewall tool found (nft or iptables)"
+            warn "install nftables or iptables plugin for firewall enforcement"
+            warn "interface management will still provide isolation"
+            ;;
+    esac
+}
+
+_fw_disengage() {
+    local fw
+    fw=$(_fw_tool)
+    case "$fw" in
+        nft)      _nft_flush  ;;
+        iptables) _ipt_flush  ;;
+        none)     info "no firewall tool — nothing to flush" ;;
+    esac
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# MODULE MANAGEMENT — AIRGAPPED LEVEL
+# Network modules are identified by their kernel subsystem.
+# We remove them from RAM; they can only come back via explicit modprobe.
+#───────────────────────────────────────────────────────────────────────────────
+
+# Known network driver module name patterns.
+# This is a conservative list — patterns that identify hardware NIC drivers.
+# We do NOT remove: netfilter, loopback, 
+_NET_MODULE_PATTERNS="
+e1000 e1000e igb ixgbe igc
+r8169 r8168 r8125
+virtio_net
+ath9k ath10k ath11k ath12k
+iwlwifi iwlmvm iwldvm
+brcmfmac brcmsmac
+mt76 mt7921 mt7922 mt7925
+rtl8xxxu rtl8192cu rtl8188eu
+8139cp 8139too
+forcedeth
+sky2 skge
+tg3 bnx2
+sfc
+be2net
+mlx4_en mlx5_core
+qede
+i40e iavf
+hv_netvsc                       
+vmxnet3
+ax88179_178a cdc_ether cdc_ncm   
+usbnet
+"
+
+_save_and_remove_net_modules() {
+    _init_state_dir
+    : > "$MOD_SAVE"
+
+    if ! _has_modprobe; then
+        warn "modprobe not available — cannot remove modules (AIRGAPPED level degraded)"
+        return 1
+    fi
+
+    # Get currently loaded modules
+    local loaded
+    loaded=$(cut -d' ' -f1 /proc/modules 2>/dev/null || lsmod | awk 'NR>1 {print $1}')
+
+    local removed_count=0
+    local pattern mod
+
+    for pattern in $_NET_MODULE_PATTERNS; do
+        [ -z "$pattern" ] && continue
+        # Find loaded modules matching this pattern
+        for mod in $loaded; do
+            case "$mod" in
+                *"${pattern}"*|"${pattern}"*)
+                    # Don't remove modules that other non-net modules depend on
+                    local used_by
+                    used_by=$(grep "^${mod} " /proc/modules 2>/dev/null | awk '{print $4}' | tr ',' '\n' | grep -v '^$' || true)
+                    if [ -z "$used_by" ] || [ "$used_by" = "-" ]; then
+                        if modprobe -r "$mod" 2>/dev/null; then
+                            printf '%s\n' "$mod" >> "$MOD_SAVE"
+                            ok "removed module: $mod"
+                            removed_count=$((removed_count + 1))
+                        else
+                            warn "could not remove: $mod (may be in use)"
+                        fi
+                    else
+                        warn "skipping $mod — used by: $used_by"
+                    fi
+                    ;;
+            esac
+        done
+    done
+
+    ok "$removed_count network module(s) removed from RAM"
+}
+
+_restore_net_modules() {
+    [ -f "$MOD_SAVE" ] && [ -s "$MOD_SAVE" ] || { info "no modules to restore"; return 0; }
+
+    local mod
+    while IFS= read -r mod; do
+        [ -z "$mod" ] && continue
+        modprobe "$mod" 2>/dev/null && ok "restored module: $mod" \
+            || warn "could not reload module: $mod (may need reboot)"
+    done < "$MOD_SAVE"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# ENGAGEMENT LEVELS
+#───────────────────────────────────────────────────────────────────────────────
+
+_engage_firewalled() {
+    log "engaging FIREWALLED"
+    _save_iface_states
+    _fw_engage
+    _write_state "$LEVEL_FIREWALLED"
+    ok "level 1: FIREWALLED"
+}
+
+_engage_isolated() {
+    local current_level
+    current_level=$(_read_state)
+
+    # Apply FIREWALLED first if not already there
+    [ "$current_level" -lt "$LEVEL_FIREWALLED" ] && _engage_firewalled
+
+    log "engaging ISOLATED"
+
+    local iface
+    for iface in $(_get_external_ifaces); do
+        _iface_down "$iface" && ok "DOWN: $iface" || warn "could not bring down: $iface"
+    done
+
+    # Flush routing table — no routes = no routing even if iface comes back up
+    if _has_ip; then
+        ip route flush table all 2>/dev/null || true
+        ip -6 route flush table all 2>/dev/null || true
+        ip neigh flush all 2>/dev/null || true
+        ok "routing tables flushed"
+    fi
+
+    _write_state "$LEVEL_ISOLATED"
+    ok "level 2: ISOLATED"
+}
+
+_engage_airgapped() {
+    local current_level
+    current_level=$(_read_state)
+
+    [ "$current_level" -lt "$LEVEL_ISOLATED" ] && _engage_isolated
+
+    log "engaging AIRGAPPED — removing net modules from RAM"
+    warn "module removal is irreversible without reboot (or modprobe restore)"
+
+    _save_and_remove_net_modules
+    _write_state "$LEVEL_AIRGAPPED"
+    ok "level 3: AIRGAPPED"
+    warn "network hardware is now inaccessible at the kernel level"
+    warn "to restore: 'netlock disengage --confirm' (attempts modprobe restore)"
+    warn "if modprobe restore fails, reboot is required"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# DISENGAGEMENT
+# Walks the level down by one step per call.
+# --full walks all the way to UNLOCKED in one shot.
+#───────────────────────────────────────────────────────────────────────────────
+
+_disengage_one_level() {
+    local current_level
+    current_level=$(_read_state)
+
+    case "$current_level" in
+        "$LEVEL_UNLOCKED")
+            info "already UNLOCKED — nothing to do"
+            return 0
+            ;;
+
+        "$LEVEL_FIREWALLED")
+            log "disengaging FIREWALLED → UNLOCKED"
+            _fw_disengage
+            _write_state "$LEVEL_UNLOCKED"
+            ok "level 0: UNLOCKED"
+            ;;
+
+        "$LEVEL_ISOLATED")
+            log "disengaging ISOLATED → FIREWALLED"
+            _restore_iface_states
+            # Routes don't auto-restore — DHCP or static config needed
+            warn "routing table was flushed — you may need to run dhcpc or set routes manually"
+            _write_state "$LEVEL_FIREWALLED"
+            ok "level 1: FIREWALLED (firewall still active)"
+            info "run 'netlock disengage --confirm' again to remove firewall"
+            ;;
+
+        "$LEVEL_AIRGAPPED")
+            log "disengaging AIRGAPPED → ISOLATED"
+            _restore_net_modules
+            _write_state "$LEVEL_ISOLATED"
+            ok "level 2: ISOLATED (modules restored, interfaces still DOWN)"
+            info "run 'netlock disengage --confirm' again to bring interfaces up"
+            ;;
+    esac
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# INTERFACE WHITELIST (for FIREWALLED level)
+#───────────────────────────────────────────────────────────────────────────────
+
+_add_allowed_iface() {
+    local iface="$1"
+    [ -d "/sys/class/net/${iface}" ] || die "interface not found: $iface"
+
+    _init_state_dir
+    touch "$ALLOW_FILE"
+    grep -qx "$iface" "$ALLOW_FILE" && { info "$iface already whitelisted"; return; }
+    printf '%s\n' "$iface" >> "$ALLOW_FILE"
+
+    # Update live firewall if engaged
+    local level
+    level=$(_read_state)
+    if [ "$level" -ge "$LEVEL_FIREWALLED" ]; then
+        _has_nft && _nft_add_allow "$iface"
+        ok "whitelisted: $iface (firewall updated)"
+    else
+        ok "whitelisted: $iface (takes effect when FIREWALLED level is engaged)"
+    fi
+}
+
+_remove_allowed_iface() {
+    local iface="$1"
+    [ -f "$ALLOW_FILE" ] || { info "whitelist is empty"; return; }
+    grep -qx "$iface" "$ALLOW_FILE" || { info "$iface is not whitelisted"; return; }
+
+    local tmp
+    tmp=$(mktemp)
+    grep -v "^${iface}$" "$ALLOW_FILE" > "$tmp" || true
+    mv "$tmp" "$ALLOW_FILE"
+
+    local level
+    level=$(_read_state)
+    if [ "$level" -ge "$LEVEL_FIREWALLED" ]; then
+        _has_nft && _nft_remove_allow "$iface"
+        ok "removed from whitelist: $iface (firewall updated)"
+    else
+        ok "removed from whitelist: $iface"
+    fi
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# STATUS DISPLAY
+#───────────────────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    local level
+    level=$(_read_state)
+    local name
+    name=$(_level_name "$level")
+    local colour
+    colour=$(_level_colour "$level")
+    local fw
+    fw=$(_fw_tool)
+
+    printf '\n'
+    printf '  %sFrugalOS Network Isolation Status%s\n' "$C_WHT" "$C_RST"
+    printf '  ──────────────────────────────────────────\n'
+    printf '  Level       : %s%s%s (level %d/3)\n' "$colour" "$name" "$C_RST" "$level"
+    printf '  Firewall    : %s\n' "$fw"
+    printf '\n'
+
+    # Show isolation components
+    local fw_active='-'
+    _has_nft && nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && fw_active='nft DROP-all active'
+    _has_iptables && iptables -L INPUT -n 2>/dev/null | grep -q 'DROP' && fw_active='iptables DROP active'
+    printf '  Firewall    : %s\n' "$fw_active"
+
+    # Show interface states
+    printf '\n  Network Interfaces:\n'
+    printf '  %-16s %-12s %s\n' "Interface" "State" "Whitelisted"
+    printf '  %s\n' "────────────────────────────────────"
+
+    local iface
+    for iface in lo $(_get_external_ifaces); do
+        local state='down'
+        _iface_is_up "$iface" && state='UP'
+        local listed=''
+        [ -f "$ALLOW_FILE" ] && grep -qx "$iface" "$ALLOW_FILE" && listed='yes'
+
+        local state_colour="$C_DIM"
+        [ "$state" = "UP" ] && state_colour="$C_GRN"
+        [ "$iface" = "lo" ] && state_colour="$C_BLU"
+
+        printf '  %-16s %s%-12s%s %s\n' \
+            "$iface" "$state_colour" "$state" "$C_RST" "$listed"
+    done
+
+    printf '\n  Module state:\n'
+    if [ -s "$MOD_SAVE" ]; then
+        printf '  %s  %-24s%s removed from RAM:\n' "$C_YEL" "" "$C_RST"
+        while IFS= read -r m; do printf '    %s\n' "$m"; done < "$MOD_SAVE"
+    else
+        printf '  %sno modules removed%s\n' "$C_DIM" "$C_RST"
+    fi
+
+    printf '\n'
+
+    # Isolation level ladder
+    printf '  Isolation ladder:\n'
+    local l
+    for l in 0 1 2 3; do
+        local n
+        n=$(_level_name "$l")
+        local c="$C_DIM"
+        local mark='  '
+        [ "$l" -eq "$level" ] && { c=$(_level_colour "$l"); mark='→ '; }
+        [ "$l" -lt "$level" ] && { c="$C_DIM"; mark='✓ '; }
+        printf '  %s%s%s%s\n' "$c" "$mark" "$n" "$C_RST"
+    done
+    printf '\n'
+}
+
+cmd_list_ifaces() {
+    printf '\n  %-16s %-10s %-16s %s\n' "Interface" "State" "MAC" "Driver"
+    printf '  %s\n' "────────────────────────────────────────────────"
+
+    local iface
+    for iface in lo $(_get_external_ifaces); do
+        local state='down'
+        _iface_is_up "$iface" && state='UP'
+        local mac driver
+        mac=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || printf '?')
+        driver=$(readlink "/sys/class/net/${iface}/device/driver" 2>/dev/null \
+                 | xargs basename 2>/dev/null || printf '(virtual)')
+        printf '  %-16s %-10s %-16s %s\n' "$iface" "$state" "$mac" "$driver"
+    done
+    printf '\n'
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# BOOT SYSINIT HOOK INSTALLER
+# Writes the hook that engages isolation at boot if configured.
+#───────────────────────────────────────────────────────────────────────────────
+
+install_boot_hook() {
+    local hook="/etc/frugalos/init.d/sysinit.d/10-netlock.sh"
+    mkdir -p "$(dirname "$hook")"
+
+    cat > "$hook" <<'HOOK'
+#!/bin/sh
+# /etc/frugalos/init.d/sysinit.d/10-netlock.sh
+# Engages netlock at boot if configured.
+# Edit /etc/frugalos/netlock.conf to configure.
+
+NETLOCK_CONFIG="/etc/frugalos/netlock.conf"
+[ -f "$NETLOCK_CONFIG" ] || exit 0
+. "$NETLOCK_CONFIG"
+
+[ "${ENGAGE_ON_BOOT:-0}" = "1" ] || exit 0
+
+BOOT_LEVEL="${BOOT_LEVEL:-2}"
+
+printf '\033[1;33m  netlock: engaging level %s at boot...\033[0m\n' "$BOOT_LEVEL"
+netlock engage --level "$BOOT_LEVEL"
+HOOK
+    chmod 755 "$hook"
+
+    # Write default config if absent
+    if [ ! -f "$CONFIG_FILE" ]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        cat > "$CONFIG_FILE" <<'CONF'
+# /etc/frugalos/netlock.conf
+# Network isolation boot configuration
+
+# Set to 1 to engage isolation automatically at boot
+ENGAGE_ON_BOOT=0
+
+# Isolation level to engage at boot (0-3):
+#   0 = UNLOCKED    (no restrictions)
+#   1 = FIREWALLED  (DROP-all firewall, interfaces up)
+#   2 = ISOLATED    (firewall + interfaces DOWN)   ← recommended default
+#   3 = AIRGAPPED   (isolated + modules removed)
+BOOT_LEVEL=2
+CONF
+        ok "boot config written: $CONFIG_FILE"
+    fi
+
+    ok "boot hook installed: $hook"
+    info "edit $CONFIG_FILE and set ENGAGE_ON_BOOT=1 to enable"
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# USAGE
+#───────────────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+
+${C_WHT}netlock${C_RST} — FrugalOS Network Isolation Manager
+
+${C_YEL}Usage:${C_RST}
+  netlock                           show status (default)
+  netlock status                    show status (verbose)
+  netlock engage [--level N]        engage isolation
+  netlock disengage [--confirm]     walk back one level
+  netlock disengage --full          disengage all levels to UNLOCKED
+  netlock airgap                    engage --level 3 (max isolation)
+  netlock allow <iface>             whitelist interface in firewall
+  netlock deny  <iface>             remove interface from whitelist
+  netlock list-interfaces           show interfaces + state
+  netlock install-boot-hook         install sysinit hook
+
+${C_YEL}Isolation levels:${C_RST}
+  0  UNLOCKED    no restrictions
+  1  FIREWALLED  DROP-all nftables/iptables, lo untouched
+  2  ISOLATED    FIREWALLED + all external ifaces DOWN      (default engage)
+  3  AIRGAPPED   ISOLATED + network kernel modules removed
+
+${C_YEL}Notes:${C_RST}
+  disengage walks back ONE level per call (intentional — forces deliberate steps)
+  AIRGAPPED module removal requires reboot to fully undo if modprobe fails
+  Whitelist (allow/deny) only applies to FIREWALLED level
+  State lives in /run/netlock/ — cleared at every reboot (safe default)
+
+EOF
+    exit 1
+}
+
+#───────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+#───────────────────────────────────────────────────────────────────────────────
+
+[ $# -eq 0 ] && { cmd_status; exit 0; }
+
+CMD="$1"; shift
+
+# Read-only commands don't need root
+case "$CMD" in
+    status|list-interfaces) ;;
+    *) _require_root ;;
+esac
+
+case "$CMD" in
+    status)
+        cmd_status
+        ;;
+
+    engage)
+        OPT_LEVEL=2   # default: ISOLATED
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --level) OPT_LEVEL="$2"; shift 2 ;;
+                *) die "unknown option: $1" ;;
+            esac
+        done
+        case "$OPT_LEVEL" in
+            0) info "level 0 is UNLOCKED — nothing to do" ;;
+            1) _engage_firewalled  ;;
+            2) _engage_isolated    ;;
+            3) _engage_airgapped   ;;
+            *) die "invalid level: $OPT_LEVEL (must be 0-3)" ;;
+        esac
+        ;;
+
+    airgap)
+        _engage_airgapped
+        ;;
+
+    disengage)
+        OPT_CONFIRM=0
+        OPT_FULL=0
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --confirm) OPT_CONFIRM=1; shift ;;
+                --full)    OPT_FULL=1; shift ;;
+                *) die "unknown option: $1" ;;
+            esac
+        done
+
+        [ "$OPT_CONFIRM" = "0" ] && {
+            printf '\n'
+            warn "this will reduce network isolation"
+            printf '  Current level: %s%s%s\n\n' \
+                "$(_level_colour "$(_read_state)")" \
+                "$(_level_name "$(_read_state)")" \
+                "$C_RST"
+            printf '  Type "confirm" to proceed: '
+            read -r answer
+            [ "$answer" = "confirm" ] || die "aborted"
+        }
+
+        if [ "$OPT_FULL" = "1" ]; then
+            while [ "$(_read_state)" -gt "$LEVEL_UNLOCKED" ]; do
+                _disengage_one_level
+            done
+        else
+            _disengage_one_level
+        fi
+        ;;
+
+    allow)
+        [ -n "$1" ] || die "usage: netlock allow <interface>"
+        _add_allowed_iface "$1"
+        ;;
+
+    deny)
+        [ -n "$1" ] || die "usage: netlock deny <interface>"
+        _remove_allowed_iface "$1"
+        ;;
+
+    list-interfaces)
+        cmd_list_ifaces
+        ;;
+
+    install-boot-hook)
+        install_boot_hook
+        ;;
+
+    help|--help|-h)
+        usage
+        ;;
+
+    *)
+        err "unknown command: $CMD"
+        usage
+        ;;
+esac

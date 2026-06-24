@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# binsys quick-vm — launch a VM with sensible presets
+# Select a system, pick a preset or customize, and boot it straight away.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+
+require_binsys
+
+header "Quick VM Launcher"
+
+# ── step 1: pick system ───────────────────────────────────────────────────────
+echo " Available systems:"
+list_systems
+echo ""
+
+name=$(prompt "System name" "")
+binsys info "$name" &>/dev/null || die "System '$name' not found"
+meta=$(binsys info "$name" --json 2>/dev/null)
+kind=$(echo "$meta" | python3 -c "import json,sys; print(json.load(sys.stdin).get('type','?'))" 2>/dev/null)
+
+# ── step 2: boot mode ─────────────────────────────────────────────────────────
+echo -e "\n ${DIM}Boot mode depends on system type:${RST}"
+if [[ "$kind" == "iso" || "$kind" == "iso9660" ]]; then
+    info "ISO system detected — booting as CD-ROM"
+    mode="vm"
+    cdrom="--cdrom"
+    uefi=""
+    kernel=""
+    initrd=""
+elif [[ "$kind" == "ext4" || "$kind" == "fat32" ]]; then
+    boot_mode=$(select_one "Boot method" \
+        "direct kernel (fast)" \
+        "UEFI via StringsBoot (needs boot disk)" \
+        "BIOS (may need a bootloader)" \
+        "container (systemd-nspawn)")
+    case "$boot_mode" in
+        "direct kernel (fast)")
+            mode="vm"; cdrom=""; uefi=""
+            kernel=$(prompt "Path to kernel (vmlinuz)" "")
+            [[ -n "$kernel" ]] || die "Kernel required for direct boot"
+            initrd=$(prompt "Path to initrd" "") || true
+            ;;
+        "UEFI via StringsBoot (needs boot disk)")
+            mode="vm"; cdrom=""; uefi="--uefi"
+            kernel=$(prompt "Path to kernel (vmlinuz)" "")
+            [[ -n "$kernel" ]] || die "Kernel required for UEFI boot"
+            initrd=$(prompt "Path to initrd" "") || true
+            ;;
+        "BIOS (may need a bootloader)")
+            mode="vm"; cdrom=""; uefi=""
+            kernel=""; initrd=""
+            warn "BIOS boot on a bare filesystem may show GRUB rescue."
+            warn "Prefer direct kernel or UEFI mode."
+            ;;
+        "container (systemd-nspawn)")
+            mode="container"; cdrom=""; uefi=""
+            kernel=""; initrd=""
+            ;;
+    esac
+elif [[ "$kind" == "overlay" ]]; then
+    boot_mode=$(select_one "Boot method" \
+        "UEFI via StringsBoot (needs boot disk)" \
+        "container (systemd-nspawn, mounts overlay)" \
+        "BIOS (legacy, may need bootloader)")
+    case "$boot_mode" in
+        "UEFI via StringsBoot (needs boot disk)")
+            mode="vm"; cdrom=""; uefi="--uefi"
+            kernel=$(prompt "Path to kernel (vmlinuz)" "")
+            [[ -n "$kernel" ]] || die "Kernel required for UEFI boot"
+            initrd=$(prompt "Path to initrd" "") || true
+            ;;
+        "container (systemd-nspawn, mounts overlay)")
+            mode="container"; cdrom=""; uefi=""
+            kernel=""; initrd=""
+            ;;
+        "BIOS (legacy, may need bootloader)")
+            mode="vm"; cdrom=""; uefi=""
+            kernel=""; initrd=""
+            warn "BIOS boot on overlay needs a bootloader."
+            ;;
+    esac
+elif [[ "$kind" == "squashfs" ]]; then
+    info "Squashfs system — read-only, VM mode with direct kernel"
+    mode="vm"; cdrom=""; uefi=""
+    kernel=$(prompt "Path to kernel (vmlinuz)" "")
+    [[ -n "$kernel" ]] || die "Kernel required"
+    initrd=$(prompt "Path to initrd" "") || true
+else
+    mode=$(select_one "Launch mode" "vm" "container")
+    kernel=$(prompt "Path to kernel (optional)" "")
+    initrd=$(prompt "Path to initrd (optional)" "")
+    cdrom=""
+    uefi=""
+fi
+
+# ── step 3: hardware presets ───────────────────────────────────────────────────
+header "Hardware Presets"
+preset=$(select_one "Select preset" \
+    "tiny   (256M RAM, 1 CPU, no display)" \
+    "light  (512M RAM, 2 CPUs, no display)" \
+    "medium (1G RAM, 2 CPUs, display)" \
+    "large  (4G RAM, 4 CPUs, display)" \
+    "custom (set everything manually)")
+
+case "$preset" in
+    "tiny"*)   ram="256M"; cpus="1"; display="";;
+    "light"*)  ram="512M"; cpus="2"; display="";;
+    "medium"*) ram="1G";   cpus="2"; display="--display";;
+    "large"*)  ram="4G";   cpus="4"; display="--display";;
+    "custom"*)
+        ram=$(prompt "RAM" "1G")
+        cpus=$(prompt "CPUs" "2")
+        if confirm "Enable display (GTK window)?" "n"; then
+            display="--display"
+        else
+            display=""
+        fi
+        ;;
+esac
+
+# ── step 4: extra QEMU options ────────────────────────────────────────────────
+extra=""
+if confirm "Add custom QEMU arguments?" "n"; then
+    prompt "Extra QEMU args (e.g. -soundhw hda)" ""
+fi
+
+# ── step 5: review & launch ────────────────────────────────────────────────────
+header "Launch"
+echo "  System:  $name  (${kind})"
+echo "  Mode:    $mode"
+echo "  RAM:     $ram  |  CPUs:  $cpus  |  Display: ${display:-no}"
+echo "  Kernel:  ${kernel:-none}"
+echo "  Initrd:  ${initrd:-none}"
+echo "  UEFI:    ${uefi:-no}"
+echo "  CDROM:   ${cdrom:-no}"
+echo ""
+
+if confirm "Launch now?" "Y"; then
+    header "Booting ${name}"
+
+    # Build the command
+    cmd="binsys run \"$name\" --mode $mode --ram $ram --cpus $cpus"
+    [[ -n "$display" ]] && cmd+=" $display"
+    [[ -n "$cdrom"   ]] && cmd+=" $cdrom"
+    [[ -n "$uefi"    ]] && cmd+=" $uefi"
+    [[ -n "$kernel"  ]] && cmd+=" --kernel \"$kernel\""
+    [[ -n "$initrd"  ]] && cmd+=" --initrd \"$initrd\""
+    [[ -n "$extra"   ]] && cmd+=" -- $extra"
+
+    echo -e " ${DIM}\$ $cmd${RST}\n"
+    eval "$cmd"
+    echo ""
+    ok "VM session ended."
+else
+    die "Cancelled."
+fi

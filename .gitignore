@@ -1,0 +1,48 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+*.manifest
+*.spec
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+
+# ── binsys runtime ───────────────────────────────────────────────────────────
+~/.binsys/
+*.orig
+*.bak
+
+# ── FrugalOS build artifacts ─────────────────────────────────────────────────
+custom-frugal/output/*.sfs
+custom-frugal/output/*.gz
+custom-frugal/boot-disk/*.img
+custom-frugal/build/alpine-chroot/
+custom-frugal/build/initrd-stage/
+custom-frugal/build/base-stage/
+custom-frugal/build/alpine-minirootfs-*.tar.gz
+
+# ── Binsys transient mounts ──────────────────────────────────────────────────
+.custom_frugal_*
+.convert_mnt
+.merge_mnt
+.merge_save
+.OVMF_VARS.fd
+.tmp_ext4
+.tmp_mnt
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "binsys"
+version = "1.0.0"
+description = "Create and run filesystem images like VMs"
+requires-python = ">=3.10"
+license = {text = "Proprietary"}
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+    "mypy>=1.14",
+]
+
+[project.scripts]
+binsys = "binsys.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["binsys*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "N", "SIM", "PLC", "PLE", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
