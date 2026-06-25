@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import shutil
 from datetime import datetime
 from typing import Any
@@ -33,7 +34,10 @@ def convert_to_frugal(name: str) -> None:
     if old_type not in ("ext4", "squashfs"):
         raise RuntimeError(f"cannot convert type '{old_type}' to frugal")
 
-    img_path = d / (meta.get("disk") or meta.get("base"))
+    src_name = meta.get("disk") or meta.get("base")
+    if not src_name:
+        raise RuntimeError("no source image name in metadata")
+    img_path = d / src_name
     if not img_path.exists():
         raise RuntimeError(f"source image not found: {img_path}")
 
@@ -160,10 +164,8 @@ def do_frugal_merge(name: str) -> None:
     finally:
         shutil.rmtree(tmp_mnt, ignore_errors=True)
         for p in (MOUNTS / f"{name}_base", MOUNTS / f"{name}_save"):
-            try:
+            with contextlib.suppress(OSError):
                 shutil.rmtree(p)
-            except OSError:
-                pass
 
     shutil.move(str(base_img), str(base_img.with_suffix(".bak")))
     shutil.move(str(tmp_save), str(base_img))

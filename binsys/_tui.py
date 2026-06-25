@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import curses
 import logging
 import os
@@ -17,6 +18,7 @@ from binsys._boot import (
     _ensure_bootloader,
 )
 from binsys._crypto import (
+    _load_app_locks,
     do_app_unlock,
     do_encrypt,
     do_hash,
@@ -78,8 +80,7 @@ def _init_colors() -> None:
 
 def _spinner_gen() -> Any:
     while True:
-        for ch in "⣾⣽⣻⢿⡿⣟⣯⣷":
-            yield ch
+        yield from "⣾⣽⣻⢿⡿⣟⣯⣷"
 
 
 def draw_spinner(win: Any, y: int, x: int, phase: int) -> None:
@@ -91,7 +92,7 @@ def draw_spinner(win: Any, y: int, x: int, phase: int) -> None:
         pass
 
 
-def with_spinner(win: Any, msg: str, fn: Callable, *args: Any, **kwargs: Any) -> Any:
+def with_spinner(win: Any, msg: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Run a function while showing a spinner on the status line."""
     spinner = _spinner_gen()
     phase = 0
@@ -161,10 +162,8 @@ def _status_badges(meta: dict[str, Any]) -> str:
 
 
 def _safe_addstr(win: Any, y: int, x: int, s: str, *args: Any, **kwargs: Any) -> None:
-    try:
+    with contextlib.suppress(curses.error):
         win.addstr(y, x, s, *args, **kwargs)
-    except curses.error:
-        pass
 
 
 def _draw_box(win: Any, y1: int, x1: int, y2: int, x2: int) -> None:
@@ -654,7 +653,6 @@ class BinSysTUI:
     def _ensure_unlocked(self, meta: dict[str, Any]) -> bool:
         """Ensure app-level protection is unlocked; return True if OK."""
         name = meta["name"]
-        from binsys._crypto import _load_app_locks
         locks = _load_app_locks()
         entry = locks.get(name)
         if entry and not entry.get("unlocked", False):
@@ -892,7 +890,5 @@ class BinSysTUI:
 def cmd_tui() -> None:
     """Launch the curses TUI."""
     sys.stderr.write("Starting TUI...\n")
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         curses.wrapper(lambda stdscr: BinSysTUI(stdscr).run())
-    except KeyboardInterrupt:
-        pass

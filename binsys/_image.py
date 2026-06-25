@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import os
 import shutil
 import urllib.error
@@ -10,7 +12,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from binsys._crypto import _ensure_app_unlocked
+from binsys._crypto import (
+    _ensure_app_unlocked,
+    do_encrypt,
+)
 from binsys._util import (
     MOUNTS,
     TYPES,
@@ -74,7 +79,6 @@ def _flash_source(distro: str, d: Path, size: str) -> None:
     try:
         urllib.request.urlretrieve(url, tmp_path)
         if expected_hash and expected_hash != "0" * 64:
-            import hashlib
             sha256 = hashlib.sha256()
             with open(tmp_path, "rb") as f:
                 for chunk in iter(lambda: f.read(8192), b""):
@@ -97,11 +101,12 @@ def _flash_source(distro: str, d: Path, size: str) -> None:
         actual = img_path.stat().st_size
         if target > actual:
             # Detect format — skip resize for qcow2/ISO
-            magic = img_path.read_bytes(8)
+            with open(img_path, "rb") as f:
+                magic = f.read(32774)
             if magic[:4] == b'QFI\xfb':
                 logger.warning("qcow2 format detected — resize skipped (use qemu-img)")
                 return
-            if magic[32768:32774] != b'\x53\xef\x01':
+            if len(magic) < 32774 or magic[32768:32774] != b'\x53\xef\x01':
                 logger.warning("non-ext4 format detected — resize skipped")
                 return
             logger.info("Resizing %s → %s", human(actual), human(target))
@@ -132,7 +137,7 @@ def do_new(
         raise RuntimeError(f"unknown type '{img_type}' — choose from {', '.join(TYPES)}")
     if sys_dir(name).exists():
         raise RuntimeError(f"'{name}' already exists")
-    
+
     # Validate sizes
     _validate_size(size)
     if save_size:
@@ -251,7 +256,6 @@ def do_new(
         if encrypt:
             # Defer meta save — encryption will update it
             save_meta(name, meta)
-            from binsys._crypto import do_encrypt
             try:
                 do_encrypt(name)
             except Exception as e:
@@ -418,14 +422,10 @@ def _mount_image(kind: str, d: Path, meta: dict[str, Any], mnt: Path) -> None:
             except Exception:
                 sh(["umount", str(save_mnt)], sudo=True, check=False)
                 sh(["umount", str(base_mnt)], sudo=True, check=False)
-                try:
+                with contextlib.suppress(Exception):
                     save_mnt.rmdir()
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(Exception):
                     base_mnt.rmdir()
-                except Exception:
-                    pass
                 raise
         else:
             sh(["mount", "-o", "loop,ro", str(d / meta["base"]), str(mnt)], sudo=True)
@@ -551,7 +551,7 @@ def do_resize(name: str, new_size: str) -> None:
 
     # Validate new_size early
     _validate_size(new_size)
-    
+
     d = sys_dir(name)
     new_size = resolve_size(new_size)
     target_bytes = _size_to_bytes(new_size)

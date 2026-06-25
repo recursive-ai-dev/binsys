@@ -8,7 +8,7 @@ build/
 *.whl
 *.manifest
 *.spec
-
+KIMI_CHANGES.md
 # ── Editor / IDE ─────────────────────────────────────────────────────────────
 *.swp
 *.swo
@@ -46,3 +46,7 @@ custom-frugal/build/alpine-minirootfs-*.tar.gz
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/

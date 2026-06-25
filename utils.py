@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import List, Tuple
 
 
 # Colors (ANSI)
@@ -40,13 +39,13 @@ def confirm(msg: str, default: bool = False) -> bool:
     return resp in ("y", "yes")
 
 
-def write_undo_log(path: Path, ops: List[Tuple[str, str]]):
+def write_undo_log(path: Path, ops: list[tuple[str, str]]):
     """Write undo log mapping new -> old so renames can be reverted."""
     data = {"ops": [{"src": s, "dst": d} for s, d in ops], "created": None}
     path.write_text(json.dumps(data, indent=2))
 
 
-def preview_and_apply_renames(ops: List[Tuple[Path, Path]], dry_run: bool = True, undo_log: Path | None = None) -> None:
+def preview_and_apply_renames(ops: list[tuple[Path, Path]], dry_run: bool = True, undo_log: Path | None = None) -> None:
     """Show planned renames, optionally apply them and write undo log.
 
     ops: list of (src, dst)

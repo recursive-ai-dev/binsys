@@ -2,25 +2,26 @@
 
 from __future__ import annotations
 
-import pytest
+import urllib.error
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from binsys._image import (
     _flash_source,
-    do_new,
-    do_delete,
-    do_clone,
-    do_rename,
-    do_export,
     do_check,
-    do_mount,
-    do_umount,
-    do_snap,
+    do_clone,
+    do_delete,
+    do_export,
     do_import,
+    do_mount,
+    do_new,
+    do_rename,
     do_resize,
+    do_snap,
+    do_umount,
 )
-
 
 # =============================================================================
 # Exception handling tests for _image.py
@@ -42,27 +43,25 @@ class TestFlashSource:
     @patch("binsys._image.urllib.request.urlretrieve")
     def test_download_failure_raises(self, mock_retrieve) -> None:
         """Test that download failure raises RuntimeError."""
-        import urllib.error
         mock_retrieve.side_effect = urllib.error.URLError("Download failed")
-        
+
         with pytest.raises(RuntimeError, match="download failed"):
             _flash_source("ubuntu", Path("/tmp/test"), "1G")
 
     @patch("binsys._image.urllib.request.urlretrieve")
     def test_hash_mismatch_raises(self, mock_retrieve, tmp_path) -> None:
         """Test that hash mismatch raises RuntimeError."""
-        import hashlib
-        
+
         # Create a temporary directory
         d = tmp_path / "test"
         d.mkdir()
-        
+
         # Mock urlretrieve to create a file with wrong content
         def mock_urlretrieve(url, path):
             (Path(path)).write_text("wrong content")
-        
+
         mock_retrieve.side_effect = mock_urlretrieve
-        
+
         with pytest.raises(RuntimeError, match="download hash mismatch"):
             _flash_source("ubuntu", d, "1G")
 
@@ -74,7 +73,7 @@ class TestDoNew:
     def test_duplicate_name_raises(self, mock_sys_dir) -> None:
         """Test that duplicate system name raises RuntimeError."""
         mock_sys_dir.return_value = MagicMock(exists=lambda: True)
-        
+
         with pytest.raises(RuntimeError, match="already exists"):
             do_new("existing-system", "ext4", "1G")
 
@@ -104,10 +103,10 @@ class TestDoNew:
         """Test that cleanup happens when sh command fails during creation."""
         mock_sys_dir.return_value = tmp_path / "test"
         mock_sh.side_effect = RuntimeError("Command failed")
-        
+
         with pytest.raises(RuntimeError):
             do_new("test", "ext4", "1G")
-        
+
         # Verify sh was called
         assert mock_sh.called
 
@@ -119,7 +118,7 @@ class TestDoDelete:
     def test_not_found_raises(self, mock_sys_dir) -> None:
         """Test that deleting non-existent system raises RuntimeError."""
         mock_sys_dir.return_value = MagicMock(exists=lambda: False)
-        
+
         with pytest.raises(RuntimeError, match="not found"):
             do_delete("nonexistent")
 
@@ -129,7 +128,7 @@ class TestDoDelete:
         """Test that deleting mounted system raises RuntimeError."""
         mock_sys_dir.return_value = MagicMock(exists=lambda: True)
         mock_is_mounted.return_value = True
-        
+
         with pytest.raises(RuntimeError, match="mounted"):
             do_delete("mounted-system")
 
@@ -141,7 +140,7 @@ class TestDoClone:
     def test_src_not_found_raises(self, mock_sys_dir) -> None:
         """Test that cloning non-existent source raises RuntimeError."""
         mock_sys_dir.return_value = MagicMock(exists=lambda: False)
-        
+
         with pytest.raises(RuntimeError, match="not found"):
             do_clone("nonexistent", "new-clone")
 
@@ -151,7 +150,7 @@ class TestDoClone:
         """Test that cloning mounted source raises RuntimeError."""
         mock_sys_dir.return_value = MagicMock(exists=lambda: True)
         mock_is_mounted.return_value = True
-        
+
         with pytest.raises(RuntimeError, match="mounted"):
             do_clone("mounted-src", "new-clone")
 
@@ -159,7 +158,7 @@ class TestDoClone:
     def test_dst_exists_raises(self, mock_sys_dir) -> None:
         """Test that cloning to existing destination raises RuntimeError."""
         mock_sys_dir.side_effect = [MagicMock(exists=lambda: True), MagicMock(exists=lambda: True)]
-        
+
         with pytest.raises(RuntimeError, match="already exists"):
             do_clone("source", "existing-dest")
 
@@ -176,7 +175,7 @@ class TestDoRename:
     def test_old_not_found_raises(self, mock_sys_dir) -> None:
         """Test that renaming non-existent system raises RuntimeError."""
         mock_sys_dir.return_value = MagicMock(exists=lambda: False)
-        
+
         with pytest.raises(RuntimeError, match="not found"):
             do_rename("nonexistent", "new-name")
 
@@ -186,7 +185,7 @@ class TestDoRename:
         """Test that renaming mounted system raises RuntimeError."""
         mock_sys_dir.return_value = MagicMock(exists=lambda: True)
         mock_is_mounted.return_value = True
-        
+
         with pytest.raises(RuntimeError, match="mounted"):
             do_rename("mounted", "new-name")
 
@@ -194,7 +193,7 @@ class TestDoRename:
     def test_new_exists_raises(self, mock_sys_dir) -> None:
         """Test that renaming to existing name raises RuntimeError."""
         mock_sys_dir.side_effect = [MagicMock(exists=lambda: True), MagicMock(exists=lambda: True)]
-        
+
         with pytest.raises(RuntimeError, match="already exists"):
             do_rename("old", "existing")
 
@@ -211,7 +210,7 @@ class TestDoExport:
     def test_not_found_raises(self, mock_load_meta) -> None:
         """Test that exporting non-existent system raises RuntimeError."""
         mock_load_meta.return_value = None
-        
+
         with pytest.raises(RuntimeError, match="not found"):
             do_export("nonexistent")
 
@@ -219,7 +218,7 @@ class TestDoExport:
     def test_unknown_type_raises(self, mock_load_meta) -> None:
         """Test that exporting system with unknown type raises RuntimeError."""
         mock_load_meta.return_value = {"type": "unknown-type", "name": "test"}
-        
+
         with pytest.raises(RuntimeError, match="no export strategy"):
             do_export("test")
 
@@ -231,7 +230,7 @@ class TestDoCheck:
     def test_not_found_raises(self, mock_load_meta) -> None:
         """Test that checking non-existent system raises RuntimeError."""
         mock_load_meta.return_value = None
-        
+
         with pytest.raises(RuntimeError, match="not found"):
             do_check("nonexistent")
 
@@ -241,7 +240,7 @@ class TestDoCheck:
         """Test that checking mounted system raises RuntimeError."""
         mock_load_meta.return_value = {"type": "ext4", "name": "test", "disk": "disk.img"}
         mock_is_mounted.return_value = True
-        
+
         with pytest.raises(RuntimeError, match="mounted"):
             do_check("mounted")
 
@@ -249,7 +248,7 @@ class TestDoCheck:
     def test_unknown_type_raises(self, mock_load_meta) -> None:
         """Test that checking system with unknown type raises RuntimeError."""
         mock_load_meta.return_value = {"type": "unknown-type", "name": "test"}
-        
+
         with pytest.raises(RuntimeError, match="no check method"):
             do_check("test")
 
@@ -261,7 +260,7 @@ class TestDoMount:
     def test_not_found_raises(self, mock_load_meta) -> None:
         """Test that mounting non-existent system raises RuntimeError."""
         mock_load_meta.return_value = None
-        
+
         with pytest.raises(RuntimeError, match="not found"):
             do_mount("nonexistent")
 
@@ -273,7 +272,7 @@ class TestDoMount:
         mock_load_meta.return_value = {"type": "ext4", "name": "test", "disk": "disk.img"}
         mock_mounts.return_value = Path("/mnt/test")
         mock_is_mounted.return_value = True
-        
+
         with pytest.raises(RuntimeError, match="already mounted"):
             do_mount("test")
 
@@ -287,7 +286,7 @@ class TestDoUmount:
         """Test that unmounting non-mounted system raises RuntimeError."""
         mock_mounts.return_value = Path("/mnt/test")
         mock_is_mounted.return_value = False
-        
+
         with pytest.raises(RuntimeError, match="not mounted"):
             do_umount("test")
 
@@ -299,7 +298,7 @@ class TestDoSnap:
     def test_not_found_raises(self, mock_load_meta) -> None:
         """Test that snapping non-existent system raises RuntimeError."""
         mock_load_meta.return_value = None
-        
+
         with pytest.raises(RuntimeError, match="not found"):
             do_snap("nonexistent")
 
@@ -307,7 +306,7 @@ class TestDoSnap:
     def test_non_overlay_type_raises(self, mock_load_meta) -> None:
         """Test that snapping non-overlay system raises RuntimeError."""
         mock_load_meta.return_value = {"type": "ext4", "name": "test"}
-        
+
         with pytest.raises(RuntimeError, match="snapshot only supported for overlay"):
             do_snap("test")
 
@@ -325,7 +324,7 @@ class TestDoImport:
         # Create a temp file
         temp_file = tmp_path / "test.img"
         temp_file.write_bytes(b"test")
-        
+
         with pytest.raises(RuntimeError, match="invalid name"):
             do_import(str(temp_file), "bad name")
 
@@ -335,7 +334,7 @@ class TestDoImport:
         temp_file = tmp_path / "test.img"
         temp_file.write_bytes(b"test")
         mock_sys_dir.return_value = MagicMock(exists=lambda: True)
-        
+
         with pytest.raises(RuntimeError, match="already exists"):
             do_import(str(temp_file), "existing")
 
@@ -347,7 +346,7 @@ class TestDoResize:
     def test_not_found_raises(self, mock_load_meta) -> None:
         """Test that resizing non-existent system raises RuntimeError."""
         mock_load_meta.return_value = None
-        
+
         with pytest.raises(RuntimeError, match="not found"):
             do_resize("nonexistent", "2G")
 
@@ -359,7 +358,7 @@ class TestDoResize:
         mock_load_meta.return_value = {"type": "ext4", "name": "test", "disk": "disk.img"}
         mock_mounts.return_value = Path("/mnt/test")
         mock_is_mounted.return_value = True
-        
+
         with pytest.raises(RuntimeError, match="mounted"):
             do_resize("test", "2G")
 
@@ -367,7 +366,7 @@ class TestDoResize:
     def test_unsupported_type_raises(self, mock_load_meta) -> None:
         """Test that resizing unsupported type raises RuntimeError."""
         mock_load_meta.return_value = {"type": "squashfs", "name": "test"}
-        
+
         with pytest.raises(RuntimeError, match="resize not supported"):
             do_resize("test", "2G")
 
@@ -375,7 +374,7 @@ class TestDoResize:
     def test_invalid_size_raises(self, mock_load_meta) -> None:
         """Test that invalid size raises RuntimeError."""
         mock_load_meta.return_value = {"type": "ext4", "name": "test", "disk": "disk.img"}
-        
+
         with pytest.raises(RuntimeError, match="invalid size"):
             do_resize("test", "invalid")
 
@@ -396,9 +395,9 @@ class TestImageIntegration:
         """Test that do_new creates directory and calls shell commands."""
         mock_sys_dir.return_value = tmp_path / "test"
         mock_resolve.return_value = "1073741824"
-        
+
         do_new("test", "ext4", "1G")
-        
+
         # Verify system directory was accessed
         assert mock_sys_dir.called
         # Verify ensure_dirs was called
@@ -423,13 +422,12 @@ class TestImageIntegration:
         mock_sys_dir.return_value = tmp_path / "test"
         mock_mounts.return_value = tmp_path / "mnt" / "test"
         mock_is_mounted.return_value = False
-        
+
         do_mount("test")
-        
+
         # Verify mount was called
         assert mock_sh.called
         # Check that mount command was in the calls
-        calls = [str(c) for c in mock_sh.call_args_list]
         assert any("mount" in str(c).lower() for c in mock_sh.call_args_list)
 
     @patch("binsys._image.load_meta")
@@ -443,11 +441,10 @@ class TestImageIntegration:
             "disk": "disk.img"
         }
         mock_sys_dir.return_value = tmp_path / "test"
-        
+
         with patch("binsys._image.is_mounted", return_value=False):
             do_check("test")
-        
+
         # Verify e2fsck was called for ext4
         assert mock_sh.called
-        calls = [str(c) for c in mock_sh.call_args_list]
         assert any("e2fsck" in str(c) for c in mock_sh.call_args_list)

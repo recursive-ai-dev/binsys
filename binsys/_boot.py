@@ -10,6 +10,7 @@ from typing import Any
 
 from binsys._util import (
     EFI_BIN,
+    OVMF_CANDIDATES,
     REPO_DIR,
     _size_to_bytes,
     _validate_name,
@@ -41,7 +42,10 @@ def layout_of(name: str) -> list[Partition]:
     meta = load_meta(name)
     if not meta:
         raise RuntimeError(f"'{name}' not found")
-    return meta.get("partitions", [])
+    raw = meta.get("partitions", [])
+    if not isinstance(raw, list):
+        return []
+    return [Partition(p["label"], p["size"], p["fs"], p.get("flags", [])) for p in raw if isinstance(p, dict)]
 
 
 def is_gpt_layout(name: str) -> bool:
@@ -107,10 +111,7 @@ def _assemble_gpt(
     try:
         for i, p in enumerate(parts, 1):
             size_bytes = _size_to_bytes(p.size)
-            if i == len(parts):
-                size_bytes = img_size - part_start
-            else:
-                size_bytes = min(size_bytes, img_size - part_start)
+            size_bytes = img_size - part_start if i == len(parts) else min(size_bytes, img_size - part_start)
             size_bytes = _align_up(size_bytes, 1024 * 1024)
 
             part_label = f"{boot_name}-p{i}"
@@ -137,7 +138,6 @@ def _assemble_gpt(
 
 def _find_ovmf() -> tuple[str | None, str | None]:
     """Find OVMF UEFI firmware on the host."""
-    from binsys._util import OVMF_CANDIDATES
     for code, vars_ in OVMF_CANDIDATES:
         if os.path.exists(code):
             return code, vars_
@@ -214,12 +214,28 @@ editor yes
 """
                 (puppyboot_dir / "loader.conf").write_text(cfg)
 
+                arch_dir = esp_mnt / "EFI" / "arch"
+                arch_dir.mkdir(parents=True, exist_ok=True)
                 entry_cmdline = cmdline or _gpt_kernel_cmdline(name, parts)
                 if kernel:
+                    kernel_src = Path(kernel)
+                    if not kernel_src.exists():
+                        raise RuntimeError(f"kernel not found: {kernel}")
+                    kernel_dst = arch_dir / kernel_src.name
+                    sh(["cp", str(kernel_src), str(kernel_dst)])
+
+                    initrd_name = "initramfs.img"
+                    if initrd:
+                        initrd_src = Path(initrd)
+                        if not initrd_src.exists():
+                            raise RuntimeError(f"initrd not found: {initrd}")
+                        initrd_name = initrd_src.name
+                        sh(["cp", str(initrd_src), str(arch_dir / initrd_name)])
+
                     entry = f"""title   {name}
 type    linux-stub
-kernel  /EFI/arch/{Path(kernel).name}
-initrd  /EFI/arch/{Path(initrd).name if initrd else 'initramfs.img'}
+kernel  /EFI/arch/{kernel_src.name}
+initrd  /EFI/arch/{initrd_name}
 cmdline {entry_cmdline}
 """
                     (entries_dir / f"{name}.conf").write_text(entry)

@@ -87,16 +87,29 @@ def _build_qcmd(
     # Network
     cmd += ["-nic", "user,model=virtio-net-pci"]
 
-    # Display — use GTK if available, fall back to nographic
-    if shutil.which("qemu-system-gui"):
+    # Display — default to nographic on headless hosts; allow override via env
+    display = os.environ.get("BINSYS_QEMU_DISPLAY", "").lower()
+    if display == "none" or display == "nographic":
+        cmd += ["-nographic"]
+        use_serial_stdio = False
+    elif display == "gtk" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
         cmd += ["-display", "gtk,gl=off"]
+        use_serial_stdio = True
     else:
         cmd += ["-nographic"]
+        use_serial_stdio = False
     cmd += ["-vga", "virtio"]
-    cmd += ["-audiodev", "pa,id=pa", "-device", "intel-hda", "-device", "hda-duplex,audiodev=pa"]
 
-    # Serial for debug
-    cmd += ["-serial", "stdio"]
+    # Audio — only enabled when explicitly requested or a pulseaudio server is present
+    enable_audio = os.environ.get("BINSYS_QEMU_AUDIO", "").lower() in ("1", "true", "yes")
+    if not enable_audio and shutil.which("pactl"):
+        enable_audio = True
+    if enable_audio:
+        cmd += ["-audiodev", "pa,id=pa", "-device", "intel-hda", "-device", "hda-duplex,audiodev=pa"]
+
+    # Serial for debug (redundant with -nographic, so skip in that case)
+    if use_serial_stdio:
+        cmd += ["-serial", "stdio"]
 
     if extra:
         cmd += extra

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import getpass
 import hashlib
+import hmac
 import json
 import os
 import shutil
 import tempfile as _binsys_tf
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from binsys._util import (
     MOUNTS,
@@ -36,16 +39,14 @@ def _crypt_keyfile(passphrase: str) -> tuple[str, Any]:
                 f.write(passphrase)
                 f.write("\n")
         except Exception:
-            os.unlink(path, missing_ok=True)
+            Path(path).unlink(missing_ok=True)
             raise
     finally:
         os.umask(old_umask)
 
     def cleanup() -> None:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(path)
-        except OSError:
-            pass
 
     return path, cleanup
 
@@ -74,8 +75,6 @@ def do_encrypt(name: str, hash_algo: str = "sha256", passphrase: str | None = No
     if not shutil.which("cryptsetup"):
         raise RuntimeError("cryptsetup not found — sudo apt install cryptsetup")
 
-    import hmac
-    
     if not passphrase:
         pp = getpass.getpass("Enter encryption passphrase: ")
         cf = getpass.getpass("Confirm passphrase: ")
@@ -191,7 +190,7 @@ def _load_app_locks() -> dict[str, Any]:
     p = STORE / "app_locks.json"
     if p.exists():
         try:
-            return json.loads(p.read_text())
+            return cast(dict[str, Any], json.loads(p.read_text()))
         except Exception:
             return {}
     return {}
@@ -204,12 +203,11 @@ def _save_app_locks(locks: dict[str, Any]) -> None:
 
 def _is_app_unlocked(name: str) -> bool:
     locks = _load_app_locks()
-    return locks.get(name, {}).get("unlocked", False)
+    return bool(locks.get(name, {}).get("unlocked", False))
 
 
 def _check_rate_limit(name: str) -> None:
     """Check and enforce authentication rate limiting."""
-    import time
     now = time.time()
     failures, last_time = _auth_failures.get(name, (0, 0.0))
     if now - last_time > _RATE_LIMIT_WINDOW:
@@ -224,7 +222,6 @@ def _check_rate_limit(name: str) -> None:
 
 def _record_failure(name: str) -> None:
     """Record a failed authentication attempt."""
-    import time
     failures, last_time = _auth_failures.get(name, (0, 0.0))
     _auth_failures[name] = (failures + 1, last_time if failures > 0 else time.time())
 
@@ -252,8 +249,6 @@ def _ensure_app_unlocked(name: str) -> None:
 
 def do_protect(name: str, password: str | None = None, keyfile: str | None = None) -> None:
     """Set app-level password+keyfile protection on a system."""
-    import hmac
-    
     meta = load_meta(name)
     if not meta:
         raise RuntimeError(f"'{name}' not found")
@@ -281,9 +276,6 @@ def do_unprotect(name: str) -> None:
 
 def do_app_unlock(name: str, password: str | None = None) -> None:
     """Authenticate to unlock a protected system for this session."""
-    import hmac
-    import time
-    
     _check_rate_limit(name)
     locks = _load_app_locks()
     entry = locks.get(name)
@@ -294,12 +286,12 @@ def do_app_unlock(name: str, password: str | None = None) -> None:
     keyfile = entry.get("keyfile")
     actual_hash = _app_lock_hash(password, keyfile)
     expected_hash = entry["hash"]
-    
+
     # Constant-time comparison to prevent timing attacks
     if not hmac.compare_digest(actual_hash, expected_hash):
         _record_failure(name)
         raise RuntimeError("incorrect password")
-    
+
     _clear_failures(name)
     entry["unlocked"] = True
     entry["unlocked_at"] = time.time()

@@ -8,11 +8,19 @@ from pathlib import Path
 
 from binsys._crypto import _ensure_app_unlocked
 from binsys._util import (
+    ISO_CREATORS,
     load_meta,
     logger,
     sh,
     sys_dir,
 )
+
+
+def _find_iso_tool() -> str:
+    for binary in ISO_CREATORS:
+        if shutil.which(binary):
+            return binary
+    raise RuntimeError("no ISO creation tool found (install mkisofs or genisoimage)")
 
 
 def do_iso_create(name: str, output: str | None = None) -> None:
@@ -48,7 +56,7 @@ def do_iso_create(name: str, output: str | None = None) -> None:
         else:
             raise RuntimeError(f"ISO creation not supported for type '{kind}'")
 
-        sh(["mkisofs", "-o", str(iso_path),
+        sh([_find_iso_tool(), "-o", str(iso_path),
             "-V", label, "-R", "-J",
             str(iso_dir)])
         logger.info("ISO created: %s", iso_path)
@@ -66,7 +74,7 @@ def do_iso_from_dir(source_dir: str, output: str | None = None, label: str | Non
     if not iso_path.parent.exists():
         raise RuntimeError(f"output directory does not exist: {iso_path.parent}")
 
-    cmd = ["mkisofs", "-o", str(iso_path), "-V", vol_label, "-R", "-J"]
+    cmd = [_find_iso_tool(), "-o", str(iso_path), "-V", vol_label, "-R", "-J"]
     if bootable:
         # Look for an isolinux or EFI boot image in the source
         isolinux = src / "isolinux" / "isolinux.bin"

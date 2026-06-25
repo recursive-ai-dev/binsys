@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+
 import pytest
 
 from binsys._util import (
@@ -12,8 +14,8 @@ from binsys._util import (
     _size_to_bytes,
     _unique_snap_name,
     _validate_name,
-    _validate_size,
     _validate_positive_int,
+    _validate_size,
     check_dependencies,
     human,
     resolve_size,
@@ -195,7 +197,6 @@ def test_validate_size_valid() -> None:
 
 
 def test_validate_size_invalid() -> None:
-    import pytest
     with pytest.raises(RuntimeError, match="invalid size"):
         _validate_size("invalid")
     with pytest.raises(RuntimeError, match="invalid size"):
@@ -210,7 +211,6 @@ def test_validate_positive_int_valid() -> None:
 
 
 def test_validate_positive_int_invalid() -> None:
-    import pytest
     with pytest.raises(RuntimeError, match="invalid value"):
         _validate_positive_int("-1")
     with pytest.raises(RuntimeError, match="invalid value"):
@@ -220,7 +220,6 @@ def test_validate_positive_int_invalid() -> None:
 
 
 def test_check_dependencies() -> None:
-    import shutil
     result = check_dependencies()
     assert isinstance(result, dict)
     # Should return empty dict or dict with missing deps

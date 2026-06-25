@@ -6,10 +6,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn, cast
 
 logger = logging.getLogger("binsys")
 if not logger.handlers:
@@ -111,7 +112,7 @@ def load_keybindings() -> dict[str, str]:
 # ── core helpers ──────────────────────────────────────────────────────────────
 
 
-def die(msg: str) -> None:
+def die(msg: str) -> NoReturn:
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -123,31 +124,31 @@ REQUIRED_BINARIES: dict[str, list[str]] = {
     "encryption": ["cryptsetup", "losetup"],
     "qemu": ["qemu-system-x86_64"],
     "gpt": ["sgdisk"],
-    "iso": ["mkisofs", "isoinfo"],
+    "iso": ["isoinfo"],
     "fsck": ["e2fsck", "fsck.fat"],
 }
+
+ISO_CREATORS = ["mkisofs", "genisoimage"]
+
+
+def _any_present(binaries: list[str]) -> bool:
+    return any(shutil.which(b) for b in binaries)
 
 
 def check_dependencies(operation: str | None = None) -> dict[str, list[str]]:
     """Check for required system dependencies. Returns dict of missing deps."""
-    import shutil
     missing: dict[str, list[str]] = {}
-    
-    if operation:
-        bins = REQUIRED_BINARIES.get(operation, [])
-    else:
-        bins = []
-        for deps in REQUIRED_BINARIES.values():
-            bins.extend(deps)
-        bins = list(set(bins))
-    
+
     for category, binaries in REQUIRED_BINARIES.items():
         if operation and operation != category:
             continue
         category_missing = [b for b in binaries if not shutil.which(b)]
         if category_missing:
             missing[category] = category_missing
-    
+
+    if (operation is None or operation == "iso") and not _any_present(ISO_CREATORS):
+        missing.setdefault("iso", []).extend(ISO_CREATORS)
+
     return missing
 
 
@@ -169,11 +170,12 @@ def sh(
     sudo: bool = False,
     quiet: bool = False,
     env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess:
+    cwd: str | None = None,
+) -> subprocess.CompletedProcess[Any]:
     if capture and quiet:
         raise ValueError("capture and quiet are mutually exclusive")
     if sudo and os.geteuid() != 0:
-        cmd = ["sudo"] + list(cmd)
+        cmd = ["sudo", *list(cmd)]
     logger.debug("sh: %s (sudo=%s, check=%s, capture=%s)", cmd, sudo, check, capture)
     kw: dict[str, Any] = {"check": check}
     if capture:
@@ -182,6 +184,8 @@ def sh(
         kw |= {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if env is not None:
         kw["env"] = {**os.environ, **env}
+    if cwd is not None:
+        kw["cwd"] = cwd
     try:
         return subprocess.run(cmd, **kw)
     except subprocess.CalledProcessError as e:
@@ -205,7 +209,7 @@ def load_meta(name: str) -> dict[str, Any] | None:
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text())
+        return cast(dict[str, Any], json.loads(p.read_text()))
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -325,7 +329,7 @@ def _validate_name(name: str) -> None:
 
 def _validate_size(size_str: str) -> int:
     """Validate and parse a size string, returning bytes.
-    
+
     Raises RuntimeError if the size string is invalid.
     """
     try:

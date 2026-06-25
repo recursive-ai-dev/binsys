@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from binsys._boot import build_bootdisk
+from binsys._boot import build_bootdisk, layout_of
 from binsys._crypto import (
     do_app_lock,
     do_app_unlock,
@@ -36,6 +36,7 @@ from binsys._image import (
 )
 from binsys._iso import do_iso_create, do_iso_from_dir
 from binsys._qemu import _build_qcmd
+from binsys._tui import cmd_tui
 from binsys._util import (
     MOUNTS,
     SCRIPTS_DIR,
@@ -144,7 +145,6 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 def cmd_layouts(args: argparse.Namespace) -> None:
     """Show partition layout for a bootable image."""
-    from binsys._boot import layout_of
     parts = layout_of(args.name)
     if not parts:
         print(f"No partition layout for '{args.name}'")
@@ -190,7 +190,6 @@ def cmd_import(args: argparse.Namespace) -> None:
 
 def cmd_delete(args: argparse.Namespace) -> None:
     if not args.force:
-        import sys
         response = input(f"Really delete '{args.name}'? This cannot be undone. [y/N]: ")
         if response.lower() not in ('y', 'yes'):
             print("Deleted cancelled.")
@@ -496,7 +495,7 @@ def main(argv: list[str] | None = None) -> None:
         argcomplete.autocomplete(p)
 
     args = p.parse_args(argv)
-    
+
     # Check for missing system dependencies
     if args.command and args.command != "tui":
         check_dependencies_or_warn()
@@ -506,7 +505,6 @@ def main(argv: list[str] | None = None) -> None:
         logger.debug("Verbose mode enabled")
 
     if args.command is None or args.command == "tui":
-        from binsys._tui import cmd_tui
         cmd_tui()
         return
 
