@@ -4,33 +4,16 @@
 #  Architecture : x86_64
 #  Runtime      : busybox ash (no bash-isms)
 #  Filesystem   : SquashFS layers stacked via OverlayFS
-#
-#  Stage 0 : mount pseudo-filesystems, verify kernel features
-#  Stage 1 : parse cmdline, locate + mount boot device
-#  Stage 2 : probe .sfs manifests, build ascending load order
-#  Stage 3 : loop-mount each .sfs layer, record state
-#  Stage 4 : build lowerdir string, mount OverlayFS → /newroot
-#  Stage 5 : write runtime state, move mounts, pivot_root → exec init
-#
-#  Kernel cmdline parameters (all optional):
-#    frugal.dev=   /dev/sdXN   — explicit block device
-#    frugal.uuid=  <UUID>      — find device by UUID
-#    frugal.label= <LABEL>     — find device by label (default: FRUGALOS)
-#    frugal.save=  <relpath>   — save dir relative to boot root (default: save)
-#    frugal.init=  <path>      — init binary in new root (default: /sbin/init)
-#    frugal.debug= 1           — verbose logging
 #═══════════════════════════════════════════════════════════════════════════════
 
-set -e
+set -eu
 PATH=/usr/bin:/usr/sbin:/bin:/sbin
 export PATH
 
 #───────────────────────────────────────────────────────────────────────────────
 # GLOBAL STATE
-# All variables used across stages are declared here so the flow is auditable
 #───────────────────────────────────────────────────────────────────────────────
 
-# ── cmdline tunables ────────────────────────────────────────────────────────
 BOOT_LABEL="FRUGALOS"
 BOOT_UUID=""
 BOOT_DEV=""
@@ -38,20 +21,16 @@ SAVE_DIR="save"
 INIT_BIN="/sbin/init"
 DEBUG=0
 
-# ── fixed paths ─────────────────────────────────────────────────────────────
-BOOT_MOUNT="/mnt/boot"          # where boot device is mounted in initrd
-LAYERS_BASE="/mnt/layers"       # squashfs mountpoints during initrd
-NEWROOT="/newroot"              # pivot target
+BOOT_MOUNT="/mnt/boot"
+LAYERS_BASE="/mnt/layers"
+NEWROOT="/newroot"
 
-# ── runtime state paths (become /run/* after pivot) ─────────────────────────
 PLUGIN_STATE_DIR="/run/plugin-state"
 PLUGIN_LOOPS_DIR="/run/plugin-loops"
 
-# ── overlay paths (set in stage 4 after inspecting save dir) ────────────────
 UPPER_DIR=""
 WORK_DIR=""
 
-# ── accumulator temp files (used to pass data across pipe subshells) ─────────
 _MOUNTPOINTS_FILE="/run/_init_mountpoints"
 _LOOP_RECORDS_FILE="/run/_init_loop_records"
 _ORDERED_SFS_FILE="/run/_init_ordered_sfs"
@@ -65,20 +44,13 @@ dbg()  { [ "$DEBUG" = "1" ] && printf '  \033[0;36m[dbg] \033[0m %s\n' "$*"; }
 warn() { printf '  \033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 
 die() {
-    printf '\n'
-    printf '  \033[1;31m╔══════════════════════════════════════════════╗\033[0m\n'
-    printf '  \033[1;31m║  FrugalOS — FATAL BOOT ERROR                ║\033[0m\n'
-    printf '  \033[1;31m║  %-44s║\033[0m\n' "$*"
-    printf '  \033[1;31m╚══════════════════════════════════════════════╝\033[0m\n'
-    printf '\n'
+    printf '\n  \033[1;31mFATAL BOOT ERROR: %s\033[0m\n' "$*"
     printf '  Dropping to emergency shell. Type "exit" to retry boot.\n\n'
-    # /proc is up by the time any die() can fire from stage 1+
-    # so we have a usable shell environment
     exec /bin/sh
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-# STAGE 0 — EARLY MOUNTS + KERNEL FEATURE VERIFICATION
+# STAGE 0 — EARLY MOUNTS
 #───────────────────────────────────────────────────────────────────────────────
 
 stage0_early_mounts() {
@@ -86,52 +58,29 @@ stage0_early_mounts() {
 
     mount -t proc     proc     /proc     2>/dev/null || die "cannot mount /proc"
     mount -t sysfs    sysfs    /sys      2>/dev/null || die "cannot mount /sys"
+    mount -t devtmpfs devtmpfs /dev      2>/dev/null || mount -t tmpfs tmpfs /dev 2>/dev/null || die "cannot mount /dev"
 
-    # devtmpfs preferred; kernel may not have CONFIG_DEVTMPFS_MOUNT so try both
-    mount -t devtmpfs devtmpfs /dev 2>/dev/null \
-        || mount -t tmpfs -o size=2M,mode=0755 tmpfs /dev 2>/dev/null \
-        || die "cannot mount /dev"
+    mkdir -p /dev/pts /dev/shm
+    mount -t devpts -o gid=5,mode=0620 devpts /dev/pts 2>/dev/null || true
 
-    # /dev/pts — not fatal if absent (no ptys in minimal builds)
-    mkdir -p /dev/pts
-    mount -t devpts -o gid=5,mode=0620 devpts /dev/pts 2>/dev/null \
-        || warn "/dev/pts unavailable — ptys disabled"
+    mount -t tmpfs -o size=64M,mode=0755 tmpfs /run 2>/dev/null || die "cannot mount /run"
+    mkdir -p /tmp
+    mount -t tmpfs -o size=16M tmpfs /tmp 2>/dev/null || true
 
-    # /run is our working scratch space throughout the initrd
-    mount -t tmpfs -o size=64M,mode=0755 tmpfs /run 2>/dev/null \
-        || die "cannot mount /run"
-
-    # /tmp for manifest probing
-    mount -t tmpfs -o size=8M tmpfs /tmp 2>/dev/null \
-        || mkdir -p /tmp   # fall back to initrd tmpfs root
-
-    # ── kernel feature checks ──────────────────────────────────────────────
-    # We need loop, squashfs, and overlay. Probe /proc/devices and
-    # /proc/filesystems; if missing, attempt modprobe before failing.
-
-    _require_feature() {
-        local name="$1" proc_file="$2" pattern="$3"
-        grep -q "$pattern" "$proc_file" 2>/dev/null && return 0
-        dbg "  $name not found in $proc_file — attempting modprobe"
-        modprobe "$name" 2>/dev/null || true
-        grep -q "$pattern" "$proc_file" 2>/dev/null \
-            || die "$name unavailable (not built-in and modprobe failed)"
-        log "  loaded module: $name"
-    }
-
-    _require_feature "loop"      /proc/devices     "loop"
-    _require_feature "squashfs"  /proc/filesystems "squashfs"
-    _require_feature "overlay"   /proc/filesystems "overlay"
-
-    dbg "stage 0 complete"
+    # Verify features
+    for f in loop squashfs overlay; do
+        if ! grep -q "$f" /proc/filesystems /proc/devices 2>/dev/null; then
+            modprobe "$f" 2>/dev/null || true
+            grep -q "$f" /proc/filesystems /proc/devices 2>/dev/null || warn "Kernel may lack support for: $f"
+        fi
+    done
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-# STAGE 1 — PARSE CMDLINE, LOCATE BOOT DEVICE, MOUNT IT
+# STAGE 1 — LOCATE BOOT DEVICE
 #───────────────────────────────────────────────────────────────────────────────
 
 _parse_cmdline() {
-    # IFS split of /proc/cmdline is safe — no quoting in kernel cmdline
     local param
     for param in $(cat /proc/cmdline); do
         case "$param" in
@@ -143,390 +92,171 @@ _parse_cmdline() {
             frugal.debug=1) DEBUG=1                              ;;
         esac
     done
-    dbg "cmdline: dev='$BOOT_DEV' uuid='$BOOT_UUID' label='$BOOT_LABEL'"
-    dbg "cmdline: save='$SAVE_DIR' init='$INIT_BIN' debug=$DEBUG"
 }
 
 _find_boot_device() {
-    # Strategy: explicit dev > UUID > label scan
-    # Explicit device
-    if [ -n "$BOOT_DEV" ]; then
-        [ -b "$BOOT_DEV" ] || die "frugal.dev=$BOOT_DEV — not a block device"
-        log "  explicit device: $BOOT_DEV"
+    if [ -n "$BOOT_DEV" ] && [ -b "$BOOT_DEV" ]; then
         return 0
     fi
 
-    # Give kernel/udev a moment to enumerate block devices.
-    # On real hardware 1 s is usually enough; on slow USB 2 s is safer.
-    # We try up to 5 s total before giving up.
-    local waited=0
-    while [ $waited -lt 5 ]; do
-        [ "$(ls /sys/block 2>/dev/null | wc -l)" -gt 0 ] && break
+    # Wait for block devices
+    local i=0
+    while [ $i -lt 10 ]; do
+        [ -d /sys/block ] && [ "$(ls /sys/block | wc -l)" -gt 0 ] && break
         sleep 1
-        waited=$((waited + 1))
+        i=$((i + 1))
     done
 
     if [ -n "$BOOT_UUID" ]; then
-        BOOT_DEV=$(blkid -U "$BOOT_UUID" 2>/dev/null) \
-            || die "UUID '$BOOT_UUID' not found on any block device"
-        log "  UUID $BOOT_UUID → $BOOT_DEV"
-        return 0
+        BOOT_DEV=$(blkid -U "$BOOT_UUID" 2>/dev/null || true)
+        [ -n "$BOOT_DEV" ] && return 0
     fi
 
-    # Label scan via blkid
-    log "  scanning block devices for LABEL='$BOOT_LABEL'"
-    local dev
-    dev=$(blkid 2>/dev/null \
-          | grep "LABEL=\"${BOOT_LABEL}\"" \
-          | head -n1 \
-          | cut -d: -f1)
-    [ -n "$dev" ] || die "no device with LABEL='$BOOT_LABEL' found"
-    BOOT_DEV="$dev"
-    log "  label $BOOT_LABEL → $BOOT_DEV"
-}
+    # Label scan
+    BOOT_DEV=$(blkid -L "$BOOT_LABEL" 2>/dev/null || true)
+    if [ -z "$BOOT_DEV" ]; then
+        # Fallback manual scan
+        BOOT_DEV=$(blkid 2>/dev/null | grep "LABEL=\"$BOOT_LABEL\"" | head -n1 | cut -d: -f1)
+    fi
 
-_mount_boot_device() {
-    mkdir -p "$BOOT_MOUNT"
-
-    # mount read-only initially; stage 4 will remount rw if save dir is present
-    mount -o ro "$BOOT_DEV" "$BOOT_MOUNT" \
-        || die "cannot mount $BOOT_DEV → $BOOT_MOUNT"
-
-    # validate minimum required structure
-    [ -f "${BOOT_MOUNT}/os/base.sfs" ] \
-        || die "base.sfs missing at ${BOOT_MOUNT}/os/base.sfs"
-
-    log "  mounted $BOOT_DEV → $BOOT_MOUNT (ro)"
+    [ -n "$BOOT_DEV" ] || die "boot device (LABEL=$BOOT_LABEL) not found"
 }
 
 stage1_locate_boot() {
     log "Stage 1: locating boot device"
     _parse_cmdline
     _find_boot_device
-    _mount_boot_device
+
+    mkdir -p "$BOOT_MOUNT"
+    mount -o ro "$BOOT_DEV" "$BOOT_MOUNT" || die "failed to mount $BOOT_DEV"
+    [ -f "${BOOT_MOUNT}/os/base.sfs" ] || die "base.sfs not found on boot device"
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-# STAGE 2 — PROBE MANIFESTS, BUILD LOAD ORDER
-#
-# Each .sfs exposes /.plugin/manifest (key=value, ash-sourceable).
-# We probe that file by temporarily loop-mounting the .sfs, reading
-# LOAD_ORDER, then immediately dismounting.
-#
-# Output: $_ORDERED_SFS_FILE — one absolute .sfs path per line, ascending
-#         by LOAD_ORDER (base=0 always first)
+# STAGE 2 — LOAD ORDER
 #───────────────────────────────────────────────────────────────────────────────
 
 _probe_load_order() {
-    # Args  : $1 = absolute path to .sfs file
-    # Prints: LOAD_ORDER integer (default 50 if manifest absent/unparseable)
-    local sfs_path="$1"
-    local tmp_mnt loop_dev load_order
-
-    tmp_mnt=$(mktemp -d /tmp/probe_XXXXXX) || { echo 50; return; }
-    loop_dev=$(losetup -f 2>/dev/null)
-
-    if [ -z "$loop_dev" ]; then
-        warn "no free loop device for manifest probe: $(basename "$sfs_path")"
-        rm -rf "$tmp_mnt"
-        echo 50
-        return
-    fi
-
-    losetup -r "$loop_dev" "$sfs_path" 2>/dev/null
-
-    if mount -t squashfs -o ro "$loop_dev" "$tmp_mnt" 2>/dev/null; then
-        if [ -f "${tmp_mnt}/.plugin/manifest" ]; then
-            # Source in a clean subshell — only echo LOAD_ORDER
-            load_order=$(
-                unset LOAD_ORDER
-                # shellcheck disable=SC1090
-                . "${tmp_mnt}/.plugin/manifest" 2>/dev/null
-                printf '%s' "${LOAD_ORDER:-50}"
-            )
-            # Sanitise: must be a non-negative integer
-            case "$load_order" in
-                ''|*[!0-9]*) load_order=50 ;;
-            esac
-        else
-            load_order=50
-            dbg "    no manifest in $(basename "$sfs_path") — using order 50"
+    local sfs="$1"
+    local mnt loop order
+    mnt=$(mktemp -d /tmp/probe.XXXXXX)
+    loop=$(losetup -f)
+    losetup -r "$loop" "$sfs"
+    if mount -t squashfs -o ro "$loop" "$mnt" 2>/dev/null; then
+        if [ -f "$mnt/.plugin/manifest" ]; then
+            order=$(grep "^LOAD_ORDER=" "$mnt/.plugin/manifest" | cut -d= -f2 | tr -d '"')
         fi
-        umount "$tmp_mnt" 2>/dev/null
-    else
-        warn "cannot squashfs-mount $sfs_path for manifest probe"
-        load_order=50
+        umount "$mnt"
     fi
-
-    losetup -d "$loop_dev" 2>/dev/null
-    rm -rf "$tmp_mnt"
-    printf '%s' "$load_order"
+    losetup -d "$loop"
+    rmdir "$mnt"
+    printf '%s' "${order:-50}"
 }
 
 stage2_discover_plugins() {
-    log "Stage 2: discovering plugin load order"
+    log "Stage 2: resolving layers"
+    local sort_in="/run/_sort_in"
+    : > "$sort_in"
 
-    # Temporary file: "LOAD_ORDER|ABSOLUTE_PATH" — | is safe, paths use /
-    local sort_input="/run/_init_sort_input"
-    : > "$sort_input"
+    # base=0
+    printf '0|%s/os/base.sfs\n' "$BOOT_MOUNT" >> "$sort_in"
 
-    # base.sfs is always load order 0 — it is the immutable floor
-    printf '0|%s/os/base.sfs\n' "$BOOT_MOUNT" >> "$sort_input"
-
-    local enabled_dir="${BOOT_MOUNT}/plugins/enabled"
-
-    if [ -d "$enabled_dir" ]; then
-        local sfs order name
-        for sfs in "${enabled_dir}"/*.sfs; do
+    if [ -d "$BOOT_MOUNT/plugins/enabled" ]; then
+        for sfs in "$BOOT_MOUNT/plugins/enabled"/*.sfs; do
             [ -f "$sfs" ] || continue
-            name=$(basename "$sfs" .sfs)
-            log "  probing: $name"
             order=$(_probe_load_order "$sfs")
-            dbg "    $name → LOAD_ORDER=$order"
-            printf '%s|%s\n' "$order" "$sfs" >> "$sort_input"
+            printf '%s|%s\n' "$order" "$sfs" >> "$sort_in"
         done
-    else
-        warn "no plugins/enabled/ directory — booting base only"
     fi
 
-    # Sort ascending by LOAD_ORDER (field 1, numeric), strip the key prefix
-    sort -t'|' -k1 -n "$sort_input" \
-        | cut -d'|' -f2 \
-        > "$_ORDERED_SFS_FILE"
-
-    rm -f "$sort_input"
-
-    local count
-    count=$(wc -l < "$_ORDERED_SFS_FILE")
-    log "  load order resolved ($count layer(s)):"
-    while IFS= read -r sfs; do
-        log "    ↳ $(basename "$sfs")"
-    done < "$_ORDERED_SFS_FILE"
+    sort -t'|' -k1 -n "$sort_in" | cut -d'|' -f2 > "$_ORDERED_SFS_FILE"
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-# STAGE 3 — LOOP-MOUNT EACH .SFS LAYER
-#
-# Mounts each layer read-only under $LAYERS_BASE/<idx>_<name>
-# Writes two state files used by stage 4 and by plugin-ctl at runtime:
-#   $_MOUNTPOINTS_FILE  — one mountpoint per line, ascending (base first)
-#   $_LOOP_RECORDS_FILE — "name|loopdev|mountpoint" per line
+# STAGE 3 — MOUNT LAYERS
 #───────────────────────────────────────────────────────────────────────────────
 
 stage3_mount_layers() {
-    log "Stage 3: mounting SFS layers"
-
-    mkdir -p "$LAYERS_BASE"
-    mkdir -p "$PLUGIN_LOOPS_DIR"
-    mkdir -p "$PLUGIN_STATE_DIR"
+    log "Stage 3: mounting layers"
+    mkdir -p "$LAYERS_BASE" "$PLUGIN_LOOPS_DIR" "$PLUGIN_STATE_DIR"
     : > "$_MOUNTPOINTS_FILE"
     : > "$_LOOP_RECORDS_FILE"
 
     local idx=0
-    local sfs_path name mnt loop_dev
-
-    while IFS= read -r sfs_path; do
-        [ -f "$sfs_path" ] || {
-            warn "  skipping missing layer: $sfs_path"
-            continue
-        }
-
-        name=$(basename "$sfs_path" .sfs)
-        mnt="${LAYERS_BASE}/${idx}_${name}"
-
+    while read -r sfs; do
+        local name=$(basename "$sfs" .sfs)
+        local mnt="$LAYERS_BASE/${idx}_${name}"
         mkdir -p "$mnt"
+        local loop=$(losetup -f)
+        losetup -r "$loop" "$sfs"
+        mount -t squashfs -o ro "$loop" "$mnt"
 
-        loop_dev=$(losetup -f 2>/dev/null) \
-            || die "no free loop devices available (mounting $name)"
-
-        losetup -r "$loop_dev" "$sfs_path" \
-            || die "losetup failed for $sfs_path"
-
-        mount -t squashfs -o ro "$loop_dev" "$mnt" \
-            || { losetup -d "$loop_dev" 2>/dev/null; die "squashfs mount failed: $sfs_path"; }
-
-        log "  [$(printf '%02d' "$idx")] $name → $loop_dev → $mnt"
-
-        printf '%s\n' "$mnt"                           >> "$_MOUNTPOINTS_FILE"
-        printf '%s|%s|%s\n' "$name" "$loop_dev" "$mnt" >> "$_LOOP_RECORDS_FILE"
-
+        printf '%s\n' "$mnt" >> "$_MOUNTPOINTS_FILE"
+        printf '%s|%s|%s\n' "$name" "$loop" "$mnt" >> "$_LOOP_RECORDS_FILE"
         idx=$((idx + 1))
     done < "$_ORDERED_SFS_FILE"
-
-    [ "$idx" -gt 0 ] || die "no layers were mounted — cannot continue"
-    dbg "stage 3 complete: $idx layer(s) mounted"
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-# STAGE 4 — BUILD OVERLAYFS LOWERDIR + MOUNT → /newroot
-#
-# OverlayFS lowerdir is colon-separated, LEFTMOST = highest priority.
-# Our mountpoints file is ascending (base=idx0 first).
-# We prepend each new entry → last read (highest LOAD_ORDER) ends up leftmost.
-#
-# Writable upper layer:
-#   If $BOOT_MOUNT/$SAVE_DIR/upper exists (or can be created), we use it for
-#   a persistent session. Otherwise fall back to tmpfs (live/ram mode).
+# STAGE 4 — OVERLAY
 #───────────────────────────────────────────────────────────────────────────────
-
-_build_lowerdir() {
-    # Reads $_MOUNTPOINTS_FILE (ascending), prepends each entry.
-    # Result: highest-priority layer leftmost.
-    local lowerdir="" mnt
-    while IFS= read -r mnt; do
-        [ -z "$mnt" ] && continue
-        if [ -z "$lowerdir" ]; then
-            lowerdir="$mnt"
-        else
-            lowerdir="${mnt}:${lowerdir}"
-        fi
-    done < "$_MOUNTPOINTS_FILE"
-    printf '%s' "$lowerdir"
-}
-
-_prepare_upper_layer() {
-    local save_base="${BOOT_MOUNT}/${SAVE_DIR}"
-
-    # Attempt to remount boot device rw to access/create save dir
-    if mount -o remount,rw "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null; then
-        mkdir -p "${save_base}/upper" "${save_base}/work" 2>/dev/null && {
-            UPPER_DIR="${save_base}/upper"
-            WORK_DIR="${save_base}/work"
-            log "  persistent save layer: $UPPER_DIR"
-            return 0
-        }
-        # If mkdir failed (e.g. read-only filesystem type), fall through
-        mount -o remount,ro "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null || true
-    fi
-
-    # Fallback: tmpfs upper — session changes are lost on reboot
-    local rw_tmp="/run/overlay-rw"
-    mount -t tmpfs -o size=256M,mode=0755 tmpfs "$rw_tmp" 2>/dev/null \
-        || die "cannot create writable overlay upper layer (tmpfs fallback failed)"
-    UPPER_DIR="${rw_tmp}/upper"
-    WORK_DIR="${rw_tmp}/work"
-    mkdir -p "$UPPER_DIR" "$WORK_DIR"
-    warn "  tmpfs upper layer — changes will NOT persist across reboots"
-}
 
 stage4_mount_overlay() {
     log "Stage 4: mounting OverlayFS"
+    local lowerdir=""
+    while read -r mnt; do
+        if [ -z "$lowerdir" ]; then lowerdir="$mnt"; else lowerdir="$mnt:$lowerdir"; fi
+    done < "$_MOUNTPOINTS_FILE"
+
+    local save_base="$BOOT_MOUNT/$SAVE_DIR"
+    if mount -o remount,rw "$BOOT_DEV" "$BOOT_MOUNT" 2>/dev/null; then
+        mkdir -p "$save_base/upper" "$save_base/work"
+        UPPER_DIR="$save_base/upper"
+        WORK_DIR="$save_base/work"
+    else
+        warn "boot device read-only, using tmpfs for save layer"
+        mount -t tmpfs tmpfs /mnt -o size=128M
+        mkdir -p /mnt/upper /mnt/work
+        UPPER_DIR="/mnt/upper"
+        WORK_DIR="/mnt/work"
+    fi
 
     mkdir -p "$NEWROOT"
-
-    local lowerdir
-    lowerdir=$(_build_lowerdir)
-
-    [ -n "$lowerdir" ] || die "lowerdir is empty — no layers mounted"
-    dbg "lowerdir=$lowerdir"
-
-    _prepare_upper_layer
-
-    mount -t overlay overlay \
-        -o "lowerdir=${lowerdir},upperdir=${UPPER_DIR},workdir=${WORK_DIR}" \
-        "$NEWROOT" \
-        || die "OverlayFS mount failed — lowerdir='$lowerdir'"
-
-    log "  overlay mounted → $NEWROOT"
-    dbg "  upper=$UPPER_DIR work=$WORK_DIR"
+    mount -t overlay overlay -o "lowerdir=$lowerdir,upperdir=$UPPER_DIR,workdir=$WORK_DIR" "$NEWROOT"
 }
 
 #───────────────────────────────────────────────────────────────────────────────
-# STAGE 5 — WRITE RUNTIME STATE, MOVE MOUNTS, PIVOT_ROOT, EXEC INIT
+# STAGE 5 — PIVOT
 #───────────────────────────────────────────────────────────────────────────────
-
-_write_runtime_state() {
-    # All files land under $NEWROOT/run so they become /run/* after pivot.
-    local run_target="${NEWROOT}/run"
-    mkdir -p "${run_target}/plugin-state" "${run_target}/plugin-loops"
-
-    # Plugin registry — consumed by plugin-ctl for hot-load/unload
-    cp "$_LOOP_RECORDS_FILE" "${run_target}/plugin-state/active.list"
-
-    # Boot order for reference / diagnostics
-    cp "$_ORDERED_SFS_FILE"  "${run_target}/plugin-state/boot-order"
-
-    # Overlay environment — plugin-ctl needs to know upper/work dirs
-    {
-        printf 'UPPER_DIR=%s\n'   "$UPPER_DIR"
-        printf 'WORK_DIR=%s\n'    "$WORK_DIR"
-        printf 'BOOT_DEV=%s\n'    "$BOOT_DEV"
-        printf 'BOOT_MOUNT=%s\n'  "/mnt/boot"  # path inside newroot
-        printf 'LAYERS_BASE=%s\n' "$LAYERS_BASE"
-    } > "${run_target}/plugin-state/overlay.env"
-
-    # Stamp boot time
-    printf '%s\n' "$(date -u 2>/dev/null || echo 'unknown')" \
-        > "${run_target}/plugin-state/boot-time"
-
-    dbg "runtime state written to ${run_target}/plugin-state/"
-}
-
-_move_mounts() {
-    # Create mountpoint stubs in newroot before moving
-    mkdir -p \
-        "${NEWROOT}/proc" \
-        "${NEWROOT}/sys"  \
-        "${NEWROOT}/dev"  \
-        "${NEWROOT}/dev/pts" \
-        "${NEWROOT}/run"  \
-        "${NEWROOT}/mnt/boot"
-
-    mount --move /proc "${NEWROOT}/proc" || die "cannot move /proc to newroot"
-    mount --move /sys  "${NEWROOT}/sys"  || die "cannot move /sys to newroot"
-    mount --move /dev  "${NEWROOT}/dev"  || die "cannot move /dev to newroot"
-    mount --move /run  "${NEWROOT}/run"  || die "cannot move /run to newroot"
-
-    # Move boot mount so /mnt/boot is accessible in the live system
-    # (plugin-ctl needs it to load new .sfs from available/)
-    mount --move "$BOOT_MOUNT" "${NEWROOT}/mnt/boot" 2>/dev/null \
-        || warn "boot mount move failed — /mnt/boot may be unavailable in newroot"
-}
-
-_do_pivot() {
-    log "  switching root → $NEWROOT"
-
-    # pivot_root(2) requires the new root to be a mountpoint (it is — overlayfs)
-    # and requires a directory inside it to receive the old root
-    mkdir -p "${NEWROOT}/.initrd"
-
-    cd "$NEWROOT" || die "cannot cd to $NEWROOT"
-
-    pivot_root . .initrd || die "pivot_root failed"
-
-    # Now / is the new root. Old initrd root is at /.initrd.
-    # Lazy unmount the old root — anything still using it will drain naturally.
-    umount -l /.initrd 2>/dev/null || true
-
-    log "  pivot complete"
-}
 
 stage5_pivot() {
-    log "Stage 5: switching root"
-    _write_runtime_state
-    _move_mounts
-    _do_pivot
+    log "Stage 5: pivot_root"
+    mkdir -p "$NEWROOT/run/plugin-state"
+    cp "$_LOOP_RECORDS_FILE" "$NEWROOT/run/plugin-state/active.list"
+    {
+        printf 'UPPER_DIR=%s\n' "$UPPER_DIR"
+        printf 'WORK_DIR=%s\n'  "$WORK_DIR"
+        printf 'BOOT_DEV=%s\n'  "$BOOT_DEV"
+        printf 'BOOT_MOUNT=/mnt/boot\n'
+    } > "$NEWROOT/run/plugin-state/overlay.env"
 
-    # Validate init binary before exec
-    [ -f "$INIT_BIN" ] \
-        || die "$INIT_BIN not found in new root"
-    [ -x "$INIT_BIN" ] \
-        || die "$INIT_BIN exists but is not executable"
+    for fs in /proc /sys /dev /run; do
+        mkdir -p "$NEWROOT$fs"
+        mount --move "$fs" "$NEWROOT$fs"
+    done
 
-    log "  exec $INIT_BIN"
-    printf '\n'
-    exec "$INIT_BIN" || die "exec $INIT_BIN failed"
+    mkdir -p "$NEWROOT/mnt/boot"
+    mount --move "$BOOT_MOUNT" "$NEWROOT/mnt/boot"
+
+    cd "$NEWROOT"
+    mkdir -p .initrd
+    pivot_root . .initrd
+    exec chroot . "$INIT_BIN" </dev/console >/dev/console 2>&1
 }
 
 #───────────────────────────────────────────────────────────────────────────────
 # MAIN
 #───────────────────────────────────────────────────────────────────────────────
-
-printf '\n'
-printf '  \033[1;37m┌─────────────────────────────────────────────┐\033[0m\n'
-printf '  \033[1;37m│  FrugalOS — initrd starting                 │\033[0m\n'
-printf '  \033[1;37m└─────────────────────────────────────────────┘\033[0m\n'
-printf '\n'
 
 stage0_early_mounts
 stage1_locate_boot
@@ -535,5 +265,4 @@ stage3_mount_layers
 stage4_mount_overlay
 stage5_pivot
 
-# Unreachable — exec in stage5 either succeeds or die() drops to shell
-die "fell through end of /init — this should never happen"
+die "reached end of /init"
