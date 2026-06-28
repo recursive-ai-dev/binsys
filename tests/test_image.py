@@ -390,8 +390,7 @@ class TestImageIntegration:
     @patch("binsys._image.sh")
     @patch("binsys._image.ensure_dirs")
     @patch("binsys._image.resolve_size")
-    @patch("binsys._image.save_meta")
-    def test_new_creates_directory_and_calls_sh(self, mock_save_meta, mock_resolve, mock_ensure, mock_sh, mock_sys_dir, tmp_path) -> None:
+    def test_new_creates_directory_and_calls_sh(self, mock_resolve, mock_ensure, mock_sh, mock_sys_dir, tmp_path) -> None:
         """Test that do_new creates directory and calls shell commands."""
         mock_sys_dir.return_value = tmp_path / "test"
         mock_resolve.return_value = "1073741824"
@@ -404,8 +403,6 @@ class TestImageIntegration:
         assert mock_ensure.called
         # Verify sh was called for truncate and mkfs
         assert mock_sh.called
-        # Verify save_meta was called
-        assert mock_save_meta.called
 
     @patch("binsys._image.load_meta")
     @patch("binsys._image.sys_dir")

@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from binsys import BinSysError
 from binsys._boot import build_bootdisk, layout_of
 from binsys._crypto import (
     do_app_lock,
@@ -20,7 +21,12 @@ from binsys._crypto import (
     do_unlock,
     do_unprotect,
 )
-from binsys._frugal import do_frugal_list_snapshots, do_frugal_merge, do_frugal_rollback, do_frugal_save_snapshot
+from binsys._frugal import (
+    do_frugal_list_snapshots,
+    do_frugal_merge,
+    do_frugal_rollback,
+    do_frugal_save_snapshot,
+)
 from binsys._image import (
     do_check,
     do_clone,
@@ -85,30 +91,45 @@ def cmd_snap(args: argparse.Namespace) -> None:
 def cmd_run(args: argparse.Namespace) -> None:
     meta = load_meta(args.name)
     if not meta:
-        die(f"'{args.name}' not found")
+        raise BinSysError(f"'{args.name}' not found")
+
     extra: list[str] = []
-    if args.boot:
-        extra += ["-boot", args.boot]
-    cmd = _build_qcmd(args.name, meta, kvm=not args.no_kvm, gdb=args.gdb,
-                      memory=args.memory, extra=extra)
-    print(f"Running: {' '.join(cmd)}")
-    sh(cmd, check=False)
+    if args.boot_device:
+        extra += ["-boot", args.boot_device]
+
+    cmd = _build_qcmd(
+        args.name,
+        meta,
+        kvm=not args.no_kvm,
+        gdb=args.gdb,
+        memory=args.memory,
+        extra=extra
+    )
+    print(f"Running QEMU: {' '.join(cmd)}")
+    try:
+        sh(cmd, check=False)
+    except KeyboardInterrupt:
+        print("\nVM execution interrupted.")
 
 
 def cmd_shell(args: argparse.Namespace) -> None:
     meta = load_meta(args.name)
     if not meta:
-        die(f"'{args.name}' not found")
+        raise BinSysError(f"'{args.name}' not found")
+
     d = sys_dir(args.name)
-    img_path = d / meta["disk"]
+    img_path = d / (meta.get("disk") or meta.get("base", "disk.img"))
     print(f"System: {args.name}")
-    print(f"Image:  {img_path}")
+    print(f"Directory: {d}")
+    print(f"Primary Image: {img_path}")
+    print("Dropping into system shell. Type 'exit' to return.")
+
     os.system(os.environ.get("SHELL", "/bin/bash"))
 
 
 def cmd_mount(args: argparse.Namespace) -> None:
     path = do_mount(args.name)
-    print(f"Mounted at {path}")
+    print(f"Mounted '{args.name}' at {path}")
 
 
 def cmd_umount(args: argparse.Namespace) -> None:
@@ -119,69 +140,88 @@ def cmd_umount(args: argparse.Namespace) -> None:
 def cmd_list(args: argparse.Namespace) -> None:
     systems = all_systems()
     if not systems:
-        print("No systems.")
+        print("No systems found.")
         return
+
+    print(f"{'NAME':<20} {'TYPE':<10} {'SIZE':>8}  {'STATUS'}")
+    print("-" * 50)
     for meta in systems:
         name = meta["name"]
         t = meta.get("type", "?")
         d = sys_dir(name)
-        size_str = ""
+        size_str = "-"
+
+        # Determine size from primary artifact
+        p = None
         if meta.get("disk"):
             p = d / meta["disk"]
-            if p.exists():
-                size_str = human(p.stat().st_size)
         elif meta.get("base"):
             p = d / meta["base"]
-            if p.exists():
-                size_str = human(p.stat().st_size)
-        mounted = " 🔗" if is_mounted(MOUNTS / name) else ""
-        extra = ""
+
+        if p and p.exists():
+            size_str = human(p.stat().st_size)
+
+        mounted = "🔗" if is_mounted(MOUNTS / name) else ""
+
+        flags = []
         if meta.get("encrypted"):
-            extra += " [enc]"
+            flags.append("enc")
         if meta.get("frugal"):
-            extra += " [frugal]"
-        print(f"  {name:<20} {t:<10} {size_str:>8}{mounted}{extra}")
+            flags.append("frugal")
+
+        status = f"{mounted} {' '.join(f'[{f}]' for f in flags)}".strip()
+        print(f"{name:<20} {t:<10} {size_str:>8}  {status}")
 
 
 def cmd_layouts(args: argparse.Namespace) -> None:
     """Show partition layout for a bootable image."""
     parts = layout_of(args.name)
     if not parts:
-        print(f"No partition layout for '{args.name}'")
+        print(f"No partition layout defined for '{args.name}'")
         return
+
     print(f"Partition layout for '{args.name}':")
     for i, p in enumerate(parts, 1):
-        print(f"  {i}. {p.label:<10} {p.size:>8}  {p.fs}")
+        print(f"  {i}. {p.label:<12} {human(_size_to_bytes_safe(p.size)):>8}  {p.fs}")
+
+
+def _size_to_bytes_safe(s: str) -> int:
+    try:
+        from binsys._util import _size_to_bytes
+        return _size_to_bytes(s)
+    except Exception:
+        return 0
 
 
 def cmd_info(args: argparse.Namespace) -> None:
     meta = load_meta(args.name)
     if not meta:
-        die(f"'{args.name}' not found")
+        raise BinSysError(f"'{args.name}' not found")
+
     d = sys_dir(args.name)
     print(f"Name:      {meta['name']}")
     print(f"Type:      {meta.get('type', '?')}")
     print(f"Created:   {meta.get('created', '?')}")
     print(f"Encrypted: {'Yes' if meta.get('encrypted') else 'No'}")
     print(f"Frugal:    {'Yes' if meta.get('frugal') else 'No'}")
+
     if meta.get("source"):
         print(f"Source:    {meta['source']}")
-    if meta.get("disk"):
-        p = d / meta["disk"]
-        if p.exists():
-            print(f"Image:     {meta['disk']} ({human(p.stat().st_size)})")
-    if meta.get("base"):
-        p = d / meta["base"]
-        if p.exists():
-            print(f"Base:      {meta['base']} ({human(p.stat().st_size)})")
-    if meta.get("save"):
-        p = d / meta["save"]
-        if p.exists():
-            print(f"Save:      {meta['save']} ({human(p.stat().st_size)})")
+
+    for key in ("disk", "base", "save"):
+        val = meta.get(key)
+        if val:
+            p = d / val
+            sz = human(p.stat().st_size) if p.exists() else "missing"
+            print(f"{key.capitalize():<10} {val} ({sz})")
+
+    if is_mounted(MOUNTS / args.name):
+        print(f"Mounted:   Yes ({MOUNTS / args.name})")
 
 
 def cmd_resize(args: argparse.Namespace) -> None:
     do_resize(args.name, args.size)
+    print(f"Resized '{args.name}' to {args.size}")
 
 
 def cmd_import(args: argparse.Namespace) -> None:
@@ -191,18 +231,21 @@ def cmd_import(args: argparse.Namespace) -> None:
 def cmd_delete(args: argparse.Namespace) -> None:
     if not args.force:
         response = input(f"Really delete '{args.name}'? This cannot be undone. [y/N]: ")
-        if response.lower() not in ('y', 'yes'):
-            print("Deleted cancelled.")
-            sys.exit(0)
+        if response.lower() not in ("y", "yes"):
+            print("Deletion cancelled.")
+            return
     do_delete(args.name)
 
 
 def cmd_clone(args: argparse.Namespace) -> None:
-    do_clone(args.src, args.dst or f"{args.src}-copy")
+    dst = args.dst or f"{args.src}-copy"
+    do_clone(args.src, dst)
+    print(f"Cloned '{args.src}' to '{dst}'")
 
 
 def cmd_rename(args: argparse.Namespace) -> None:
     do_rename(args.old, args.new)
+    print(f"Renamed '{args.old}' to '{args.new}'")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -211,7 +254,9 @@ def cmd_export(args: argparse.Namespace) -> None:
 
 
 def cmd_check(args: argparse.Namespace) -> None:
+    print(f"Running integrity check for '{args.name}'...")
     do_check(args.name)
+    print("Check complete.")
 
 
 def cmd_encrypt(args: argparse.Namespace) -> None:
@@ -253,9 +298,12 @@ def cmd_frugal(args: argparse.Namespace) -> None:
     elif args.frugal_cmd == "list":
         snaps = do_frugal_list_snapshots(name)
         if not snaps:
-            print("No snapshots.")
+            print("No snapshots found.")
+            return
+        print(f"{'SNAPSHOT':<40} {'SIZE':>10}")
+        print("-" * 52)
         for s in snaps:
-            print(f"  {s['name']:<40} {human(s['size']):>8}")
+            print(f"  {s['name']:<40} {human(s['size']):>10}")
     elif args.frugal_cmd == "rollback":
         do_frugal_rollback(name, args.snap)
     elif args.frugal_cmd == "merge":
@@ -268,14 +316,21 @@ def cmd_wizard(args: argparse.Namespace) -> None:
         for n, d in WIZARD_SCRIPTS:
             print(f"  {n:<20} {d}")
         return
+
     if not args.name:
         print("Usage: binsys wizard <script>")
         print("Available:", ", ".join(n for n, d in WIZARD_SCRIPTS))
         return
+
     wizard_path = SCRIPTS_DIR / args.name
     if not wizard_path.exists():
-        die(f"wizard '{args.name}' not found")
-    sh([str(wizard_path)])
+        raise BinSysError(f"wizard '{args.name}' not found")
+
+    print(f"Launching wizard: {args.name}")
+    try:
+        sh([str(wizard_path)])
+    except KeyboardInterrupt:
+        print("\nWizard interrupted.")
 
 
 def cmd_iso(args: argparse.Namespace) -> None:
@@ -351,7 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("name")
     pr.add_argument("--no-kvm", action="store_true", help="Disable KVM acceleration")
     pr.add_argument("--gdb", "-g", action="store_true", help="Wait for GDB connection")
-    pr.add_argument("--boot", help="Boot device (e.g. d for CD-ROM)")
+    pr.add_argument("--boot", dest="boot_device", help="Boot device (e.g. d for CD-ROM)")
     pr.add_argument("--memory", "-m", default="2048", help="RAM in MB (default: 2048)")
 
     # shell
@@ -414,8 +469,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Hash algorithm for LUKS key derivation (default: sha256)")
 
     # unlock / lock
-    pu = sub.add_parser("unlock", help="Open a LUKS-encrypted image")
-    pu.add_argument("name")
+    punl = sub.add_parser("unlock", help="Open a LUKS-encrypted image")
+    punl.add_argument("name")
     plk = sub.add_parser("lock", help="Close a LUKS-encrypted image")
     plk.add_argument("name")
 
@@ -496,13 +551,14 @@ def main(argv: list[str] | None = None) -> None:
 
     args = p.parse_args(argv)
 
-    # Check for missing system dependencies
-    if args.command and args.command != "tui":
-        check_dependencies_or_warn()
-
+    # Set log level before doing anything
     if args.verbose:
         logging.getLogger("binsys").setLevel(logging.DEBUG)
         logger.debug("Verbose mode enabled")
+
+    # Check for missing system dependencies (skip for TUI/help)
+    if args.command and args.command not in ("tui", "help"):
+        check_dependencies_or_warn()
 
     if args.command is None or args.command == "tui":
         cmd_tui()
@@ -542,8 +598,11 @@ def main(argv: list[str] | None = None) -> None:
         }
         handler = cmd_map[args.command]
         handler(args)
-    except RuntimeError as e:
+    except BinSysError as e:
         print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"fatal error: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
