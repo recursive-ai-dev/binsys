@@ -82,7 +82,7 @@ def _next_msg_id() -> str:
     with _msg_counter_lock:
         _msg_counter += 1
         raw = f"{time.monotonic_ns()}{_msg_counter}".encode()
-    return hashlib.sha1(raw).hexdigest()[:12]
+    return hashlib.sha256(raw).hexdigest()[:12]
 
 
 @dataclass
@@ -501,7 +501,7 @@ class EventBus:
         if callback is None and queue is None:
             raise ValueError("subscriber must provide callback or queue (or both)")
         if not sub_id:
-            sub_id = hashlib.sha1(
+            sub_id = hashlib.sha256(
                 f"{pattern}{time.monotonic_ns()}".encode()
             ).hexdigest()[:12]
 
