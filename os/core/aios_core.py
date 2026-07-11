@@ -112,7 +112,7 @@ class AgentContext:
     Preserves the causality trail from initiating caller to leaf operations.
     """
     caller:   str                         = "kernel"
-    trace_id: str                         = field(default_factory=lambda: hashlib.sha1(
+    trace_id: str                         = field(default_factory=lambda: hashlib.sha256(
         str(time.monotonic_ns()).encode()).hexdigest()[:12])
     depth:    int                         = 0
     budget_ns: int                        = 10_000_000   # 10 ms default
