@@ -517,8 +517,14 @@ def mem_copy_overlap(dst: bytearray, dst_off: int,
         return
     if n > _COPY_SMALL_MAX:
         raise ValueError(f"CopyOverlap called for {n}B > {_COPY_SMALL_MAX}B limit")
-    for i in range(n):
-        dst[dst_off + i] = src[src_off + i]
+    if dst is src and dst_off == src_off:
+        return
+    if dst_off < src_off:
+        for i in range(n):
+            dst[dst_off + i] = src[src_off + i]
+    else:
+        for i in range(n - 1, -1, -1):
+            dst[dst_off + i] = src[src_off + i]
 
 
 def mem_copy_aligned(dst: bytearray, dst_off: int,
