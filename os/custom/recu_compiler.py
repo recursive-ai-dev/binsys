@@ -735,6 +735,8 @@ _TOKEN_SPLIT_RE = re.compile(r'[\s\t\n\r,;()\[\]{}<>=!&|^~+\-*/%@#$?:\\]+')
 _HTML_TAG_RE    = re.compile(r'</?([a-zA-Z][a-zA-Z0-9\-]*)(?:\s[^>]*)?>',
                               re.DOTALL | re.IGNORECASE)
 _HTML_ATTR_RE   = re.compile(r'\b([a-zA-Z][a-zA-Z0-9\-]*)=', re.IGNORECASE)
+_HTML_SCRIPT_RE = re.compile(r'<script[^>]*>(.*?)</script>',
+                              re.DOTALL | re.IGNORECASE)
 
 
 class Tokenizer:
@@ -805,9 +807,7 @@ class Tokenizer:
         for match in _HTML_ATTR_RE.finditer(text):
             result.append(_tok(match.group(1).lower()))
         # Tokenise script blocks as bash-like
-        script_re = re.compile(r'<script[^>]*>(.*?)</script>',
-                                re.DOTALL | re.IGNORECASE)
-        for m in script_re.finditer(text):
+        for m in _HTML_SCRIPT_RE.finditer(text):
             for word in _TOKEN_SPLIT_RE.split(m.group(1)):
                 if word:
                     result.append(_tok(word))
