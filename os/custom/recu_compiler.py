@@ -1433,12 +1433,13 @@ class VMemMapBuilder:
     """Serialises the virtual address layout into the VMEM_MAP section."""
 
     def build(self) -> bytes:
-        out = bytearray()
+        parts = []
         for (name, vaddr, size, flags) in _VMEM_LAYOUT:
             name_b = name.encode('ascii').ljust(16, b'\x00')[:16]
-            out   += name_b + struct.pack('<QQII', vaddr, size, flags, 0)
+            parts.append(name_b + struct.pack('<QQII', vaddr, size, flags, 0))
+        out = b''.join(parts)
         assert len(out) == len(_VMEM_LAYOUT) * VMEM_ENTRY_SIZE
-        return bytes(out)
+        return out
 
     @staticmethod
     def decode(raw: bytes) -> List[Dict[str, Any]]:
