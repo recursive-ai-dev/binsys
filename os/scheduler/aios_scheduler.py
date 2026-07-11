@@ -1351,40 +1351,8 @@ def attach_to_kernel(
 # §9  SELF-TESTS
 # ════════════════════════════════════════════════════════════════════════════════
 
-def _run_self_tests() -> bool:
-    """
-    Exhaustive validation of every scheduler component.
-
-    §1   TaskSpec / TaskFuture lifecycle
-    §2   WorkStealingDeque push/pop/steal semantics + thread safety
-    §3   WorkerStats EMA correctness
-    §4   Worker execution (synthetic, no hardware)
-    §5   PlacementScorer numerical correctness
-    §6   AdaptiveRebalancer logic
-    §7   Full AIOSScheduler: submit, map, overflow, shutdown
-    §8   Priority aging formula
-    §9   Concurrent stress test
-
-    All tests run in < 10 seconds on any modern machine.
-    """
-    ok = 0; bad = 0
-    _W = 60
-
-    def _check(condition: bool, label: str, detail: str = "") -> None:
-        nonlocal ok, bad
-        if condition:
-            ok += 1
-            print(f"  [PASS] {label}")
-        else:
-            bad += 1
-            print(f"  [FAIL] {label}  ← {detail}")
-
-    print("\n" + "═" * _W)
-    print("  AIOS Scheduler — Self-Test Suite")
-    print("═" * _W)
-
+def test_taskspec_taskfuture(_check: Callable[[bool, str, str], None]) -> None:
     # ── §1  TaskSpec / TaskFuture ─────────────────────────────────────────────
-    import math as _math
 
     spec = TaskSpec(fn=lambda x: x * 2, args=(7,))
     fut  = TaskFuture(spec)
@@ -1428,7 +1396,11 @@ def _run_self_tests() -> bool:
     _check(eff2 == int(AgentPriority.CRITICAL),
            "Priority aging: 2 intervals → CRITICAL", f"got {eff2}")
 
-    # ── §2  WorkStealingDeque ─────────────────────────────────────────────────
+
+
+def test_workstealingdeque(_check: Callable[[bool, str, str], None]) -> None:
+    # ── §2  WorkStealingDeque ─────────────────────────────────────────────
+
     dq = WorkStealingDeque(maxlen=4)
     items = [(TaskSpec(fn=lambda v=k: v, args=()), TaskFuture(TaskSpec(fn=lambda: None)))
              for k in range(4)]
@@ -1452,8 +1424,8 @@ def _run_self_tests() -> bool:
 
     # Thread-safety: concurrent pushes and steals
     dq2 = WorkStealingDeque(maxlen=200)
-    errors: List[str] = []
-    pushed_ids: List[str] = []
+    errors: list[str] = []
+    pushed_ids: list[str] = []
     push_lock = threading.Lock()
 
     def _pusher(n: int) -> None:
@@ -1473,11 +1445,17 @@ def _run_self_tests() -> bool:
         [threading.Thread(target=_pusher,  args=(20,)) for _ in range(3)] +
         [threading.Thread(target=_stealer, args=(10,)) for _ in range(2)]
     )
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=3.0)
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=3.0)
     _check(not errors, "Concurrent push/steal: no errors")
 
-    # ── §3  WorkerStats EMA ───────────────────────────────────────────────────
+
+
+def test_workerstats_ema(_check: Callable[[bool, str, str], None]) -> None:
+    # ── §3  WorkerStats EMA ─────────────────────────────────────────────
+
     ws = WorkerStats()
     # Seed is ipc_ema=2.0, α=0.222
     ws.update(ipc=4.0, miss_rate=0.0, elapsed_ns=500_000)
@@ -1498,7 +1476,11 @@ def _run_self_tests() -> bool:
     ws.record_failure()
     _check(ws.tasks_failed == 1, "WorkerStats.record_failure() increments count")
 
-    # ── §4  Worker execution ──────────────────────────────────────────────────
+
+
+def test_worker_execution(_check: Callable[[bool, str, str], None]) -> None:
+    # ── §4  Worker execution ─────────────────────────────────────────────
+
     sched_s = AIOSScheduler.synthetic(n_workers=2)
     sched_s.start()
 
@@ -1518,8 +1500,13 @@ def _run_self_tests() -> bool:
     _check(res_f.state == TaskState.FAILED, "Worker: state == FAILED")
     _check("ValueError" in (res_f.error or ""),
            "Worker: error message contains exception type")
+    sched_s.stop()
 
-    # ── §5  PlacementScorer ───────────────────────────────────────────────────
+
+
+def test_placementscorer(_check: Callable[[bool, str, str], None]) -> None:
+    # ── §5  PlacementScorer ─────────────────────────────────────────────
+
     # Construct two workers on different NUMA nodes
     dist_map = {
         0: {0: 10, 1: 20},
@@ -1544,7 +1531,7 @@ def _run_self_tests() -> bool:
         if not w0.deque.push_local(_sp, _ft):
             break
     s0_loaded = scorer.score(w0, task_n0)
-    s1_loaded = scorer.score(w1, task_n0)
+
     _check(s0_loaded > s0, "PlacementScorer: full queue increases score",
            f"s0_empty={s0:.3f} s0_full={s0_loaded:.3f}")
 
@@ -1575,9 +1562,14 @@ def _run_self_tests() -> bool:
     _check(best_free is w1 if best_free else False,
            "PlacementScorer: no-preference task routes to least loaded")
 
-    # ── §6  AdaptiveRebalancer ────────────────────────────────────────────────
+
+
+def test_adaptiverebalancer(_check: Callable[[bool, str, str], None]) -> None:
+    # ── §6  AdaptiveRebalancer ─────────────────────────────────────────────
+
     rb_workers = [Worker(i, 0, [i], [], None, None) for i in range(3)]
-    for w in rb_workers: w._peers = rb_workers
+    for w in rb_workers:
+        w._peers = rb_workers
     # Load worker 0 with 200 tasks.
     # load_0 = 200/256 ≈ 0.78, μ ≈ 0.26, σ ≈ 0.37 > 0.25 → triggers rebalance.
     for _ in range(200):
@@ -1594,7 +1586,11 @@ def _run_self_tests() -> bool:
     _check(rb.stats()["tasks_migrated"] > 0,
            "Rebalancer stats records migration count")
 
-    # ── §7  Full AIOSScheduler tests ──────────────────────────────────────────
+
+
+def test_full_aiosscheduler_tests(_check: Callable[[bool, str, str], None]) -> None:
+    # ── §7  Full AIOSScheduler tests ─────────────────────────────────────────────
+
 
     # map(): parallel computation
     sched_m = AIOSScheduler.synthetic(n_workers=2)
@@ -1606,8 +1602,6 @@ def _run_self_tests() -> bool:
 
     # Overflow queue: fill workers, then submit
     # Pre-fill all worker queues to force overflow
-    futs_overflow = []
-    barrier = threading.Barrier(1, timeout=5.0)
     sched_o = AIOSScheduler.synthetic(n_workers=1)
     sched_o.start()
     overflow_fut = sched_o.submit(fn=lambda: 42)
@@ -1629,9 +1623,12 @@ def _run_self_tests() -> bool:
 
     sched_m.stop()
     sched_o.stop()
-    sched_s.stop()
 
-    # ── §8  Priority aging formula check (repeated, edge cases) ───────────────
+
+
+def test_priority_aging_formula_check_repeated_edge_cases(_check: Callable[[bool, str, str], None]) -> None:
+    # ── §8  Priority aging formula check (repeated, edge cases) ─────────────────────────────────────────────
+
     # Task with CRITICAL base priority should not go below 0
     spec_crit = TaskSpec(
         fn=lambda: None,
@@ -1651,12 +1648,16 @@ def _run_self_tests() -> bool:
     _check(eff_low == int(AgentPriority.HIGH),
            "Priority aging: LOW after 2 intervals → HIGH", f"got {eff_low}")
 
-    # ── §9  Concurrent stress test ────────────────────────────────────────────
+
+
+def test_concurrent_stress_test(_check: Callable[[bool, str, str], None]) -> None:
+    # ── §9  Concurrent stress test ─────────────────────────────────────────────
+
     sched_stress = AIOSScheduler.synthetic(n_workers=4)
     sched_stress.start()
 
-    N_TASKS  = 200
-    results_stress: List[Optional[TaskResult]] = [None] * N_TASKS
+    n_tasks = 200
+    results_stress: list[TaskResult | None] = [None] * n_tasks
     stress_lock = threading.Lock()
 
     def _submit_wave(start: int, end: int) -> None:
@@ -1666,24 +1667,26 @@ def _run_self_tests() -> bool:
             with stress_lock:
                 results_stress[i] = r
 
-    wave_size = N_TASKS // 4
+    wave_size = n_tasks // 4
     waves = [
         threading.Thread(target=_submit_wave, args=(i * wave_size, (i + 1) * wave_size))
         for i in range(4)
     ]
-    for t in waves: t.start()
-    for t in waves: t.join(timeout=15.0)
+    for t in waves:
+        t.start()
+    for t in waves:
+        t.join(timeout=15.0)
 
     done_count = sum(
         1 for r in results_stress
         if r is not None and r.state == TaskState.DONE
     )
-    _check(done_count == N_TASKS,
-           f"Stress test: all {N_TASKS} tasks completed",
-           f"done={done_count}/{N_TASKS}")
+    _check(done_count == n_tasks,
+           f"Stress test: all {n_tasks} tasks completed",
+           f"done={done_count}/{n_tasks}")
 
     # Verify a sample of values
-    expected_vals = {i: i * i for i in range(N_TASKS)}
+    expected_vals = {i: i * i for i in range(n_tasks)}
     mismatches = [
         i for i, r in enumerate(results_stress)
         if r is not None and r.value != expected_vals[i]
@@ -1693,13 +1696,51 @@ def _run_self_tests() -> bool:
 
     sched_stress.stop()
 
-    print("═" * _W)
+
+
+
+
+
+
+    # ── Entry point ───────────────────────────────────────────────────────────────
+
+
+def _run_self_tests() -> bool:
+    """
+    Exhaustive validation of every scheduler component.
+    """
+    ok = 0
+    bad = 0
+    _w = 60
+
+    def _check(condition: bool, label: str, detail: str = "") -> None:
+        nonlocal ok, bad
+        if condition:
+            ok += 1
+            print(f"  [PASS] {label}")
+        else:
+            bad += 1
+            print(f"  [FAIL] {label}  ← {detail}")
+
+    print("\n" + "═" * _w)
+    print("  AIOS Scheduler — Self-Test Suite")
+    print("═" * _w)
+
+    test_taskspec_taskfuture(_check)
+    test_workstealingdeque(_check)
+    test_workerstats_ema(_check)
+    test_worker_execution(_check)
+    test_placementscorer(_check)
+    test_adaptiverebalancer(_check)
+    test_full_aiosscheduler_tests(_check)
+    test_priority_aging_formula_check_repeated_edge_cases(_check)
+    test_concurrent_stress_test(_check)
+
+    print("═" * _w)
     print(f"  Results: {ok} passed,  {bad} failed")
-    print("═" * _W + "\n")
+    print("═" * _w + "\n")
     return bad == 0
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     success = _run_self_tests()
     sys.exit(0 if success else 1)
