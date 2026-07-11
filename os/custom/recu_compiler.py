@@ -79,6 +79,19 @@ CA_ROWS              = 16
 CA_COLS              = 16
 CA_RULE_DEFAULT      = 'B3/S23'
 
+# Precompute neighbor indices for the fixed CA grid
+_CA_NEIGHBORS = []
+for _r in range(CA_ROWS):
+    for _c in range(CA_COLS):
+        _neighbors = []
+        for _dr in (-1, 0, 1):
+            for _dc in (-1, 0, 1):
+                if _dr == 0 and _dc == 0:
+                    continue
+                _neighbors.append(((_r + _dr) % CA_ROWS) * CA_COLS + ((_c + _dc) % CA_COLS))
+        _CA_NEIGHBORS.append(_neighbors)
+
+
 VMEM_ENTRY_SIZE      = 40              # bytes per VMemRegion entry
 
 
@@ -1349,22 +1362,16 @@ class CALifecycleBuilder:
         Used at runtime to update lifecycle state.
         """
         new_grid  = [0] * (CA_ROWS * CA_COLS)
-        birth     = {3}
-        survive   = {2, 3}
-        for r in range(CA_ROWS):
-            for c in range(CA_COLS):
-                idx  = r * CA_COLS + c
-                live = grid[idx]
-                n    = sum(
-                    grid[((r + dr) % CA_ROWS) * CA_COLS + ((c + dc) % CA_COLS)]
-                    for dr in (-1, 0, 1)
-                    for dc in (-1, 0, 1)
-                    if not (dr == 0 and dc == 0)
-                )
-                if live:
-                    new_grid[idx] = 1 if n in survive else 0
-                else:
-                    new_grid[idx] = 1 if n in birth   else 0
+        for idx in range(CA_ROWS * CA_COLS):
+            live = grid[idx]
+            n_indices = _CA_NEIGHBORS[idx]
+            n = (grid[n_indices[0]] + grid[n_indices[1]] + grid[n_indices[2]] +
+                 grid[n_indices[3]] + grid[n_indices[4]] + grid[n_indices[5]] +
+                 grid[n_indices[6]] + grid[n_indices[7]])
+            if live:
+                new_grid[idx] = 1 if n == 2 or n == 3 else 0
+            else:
+                new_grid[idx] = 1 if n == 3 else 0
         return new_grid
 
     @staticmethod
