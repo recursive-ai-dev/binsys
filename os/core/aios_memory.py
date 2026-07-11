@@ -445,6 +445,23 @@ class Episode:
         self._creation_time = time.monotonic()
 
 
+
+class _EpQueueItem:
+    __slots__ = ['ep', 'access_count', 'decay_rate', 'insertion_order']
+    def __init__(self, ep, decay_rate, insertion_order):
+        self.ep = ep
+        self.access_count = ep.access_count
+        self.decay_rate = decay_rate
+        self.insertion_order = insertion_order
+
+    def __lt__(self, other):
+        s1 = self.ep.current_importance(self.decay_rate) * _m_log(1.0 + self.access_count + 1.0)
+        s2 = other.ep.current_importance(self.decay_rate) * _m_log(1.0 + other.access_count + 1.0)
+        if s1 == s2:
+            return self.insertion_order < other.insertion_order
+        return s1 < s2
+
+
 class EpisodicMemory:
     """
     Fixed-capacity long-term episode store with Ebbinghaus decay.
@@ -465,6 +482,8 @@ class EpisodicMemory:
         self.prune_thr  = prune_thr
         self._episodes: OrderedDict = OrderedDict()   # ep_id → Episode
         self._lock      = threading.RLock()
+        self._heap      = []
+        self._ep_counter = 0
 
     # ── Store ─────────────────────────────────────────────────────────────────
 
@@ -494,6 +513,10 @@ class EpisodicMemory:
             if len(self._episodes) >= self.capacity:
                 self._evict_lri()         # Least Recent + Importance
             self._episodes[ep_id] = ep
+
+            import heapq
+            self._ep_counter += 1
+            heapq.heappush(self._heap, _EpQueueItem(ep, self.decay_rate, self._ep_counter))
         return ep_id
 
     def _evict_lri(self) -> None:
@@ -502,18 +525,15 @@ class EpisodicMemory:
             score = I(t) * log(1 + access_count + 1)
         Ties broken by insertion order (oldest first).
         """
-        if not self._episodes:
-            return
-        worst_id    = None
-        worst_score = _INF
-        for ep_id, ep in self._episodes.items():
-            s = ep.current_importance(self.decay_rate) * _m_log(
-                1.0 + ep.access_count + 1.0)
-            if s < worst_score:
-                worst_score = s
-                worst_id    = ep_id
-        if worst_id:
-            del self._episodes[worst_id]
+        import heapq
+        while self._heap:
+            worst_item = heapq.heappop(self._heap)
+            ep = worst_item.ep
+            # Lazy deletion check: verify the item hasn't been touched
+            # and is still in the episodes dict.
+            if ep.ep_id in self._episodes and ep.access_count == worst_item.access_count:
+                del self._episodes[ep.ep_id]
+                return
 
     # ── Retrieve ─────────────────────────────────────────────────────────────
 
@@ -543,7 +563,11 @@ class EpisodicMemory:
         with self._lock:
             for _, ep in top:
                 if ep.ep_id in self._episodes:
-                    self._episodes[ep.ep_id].touch()
+                    ep_updated = self._episodes[ep.ep_id]
+                    ep_updated.touch()
+                    import heapq
+                    self._ep_counter += 1
+                    heapq.heappush(self._heap, _EpQueueItem(ep_updated, self.decay_rate, self._ep_counter))
 
         return top
 
