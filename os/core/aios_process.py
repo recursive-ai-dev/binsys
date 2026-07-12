@@ -1654,12 +1654,7 @@ class ProcessSubsystem:
 #  §13 — SELF-TESTS
 # ════════════════════════════════════════════════════════════════════════════════
 
-def _run_tests() -> None:
-    print("=" * 68)
-    print("  AIOS aios_process.py — Self-Test Suite")
-    print("=" * 68)
-    failures: List[str] = []
-
+def _test_loader_params(failures: List[str]) -> None:
     # ── T1: LoaderParams pack/unpack round-trip ────────────────────────────────
     print("\n[T1] LoaderParams wire format round-trip")
     lp = LoaderParams(
@@ -1691,6 +1686,8 @@ def _run_tests() -> None:
     assert len(errs) >= 3, f"Expected ≥3 validation errors, got: {errs}"
     print(f"  ✓ caught {len(errs)} invalid fields correctly")
 
+
+def _test_trap_and_switch_frames(failures: List[str]) -> None:
     # ── T3: TrapFrame wire format ──────────────────────────────────────────────
     print("\n[T3] TrapFrame pack/unpack")
     tf = TrapFrame(rax=42, rip=0xDEAD_BEEF, cs=0x08, rflags=0x202,
@@ -1712,6 +1709,8 @@ def _run_tests() -> None:
     assert sf == sf2 and len(raw) == SwitchFrame._PACK_SIZE
     print(f"  ✓ SwitchFrame {len(raw)} bytes, callee-saved fields preserved")
 
+
+def _test_memory_copy_and_erms(failures: List[str]) -> None:
     # ── T5: Memory copy tiers ─────────────────────────────────────────────────
     print("\n[T5] Memory copy tiers (CopyOverlap / CopyAligned / ERMS)")
     src = bytes(range(256)) * 40   # 10240 bytes total test source
@@ -1741,6 +1740,17 @@ def _run_tests() -> None:
     assert dst2 == bytearray(src[:8192]), "dispatch→ERMS mismatch"
     print("  ✓ All three tiers produce correct output via unified dispatcher")
 
+    # ── T13: ERMSCapability flag ──────────────────────────────────────────────
+    print("\n[T13] ERMS fallback to CopyAligned when ERMS unavailable")
+    _ERMSCapability.set_from_hardware_profile(False)
+    dst = bytearray(4096)
+    mem_copy_erms(dst, 0, bytes(range(256)) * 16, 0, 4096)
+    assert dst == bytearray(bytes(range(256)) * 16), "ERMS fallback mismatch"
+    _ERMSCapability.set_from_hardware_profile(True)  # restore default
+    print("  ✓ Non-ERMS path falls back to CopyAligned correctly")
+
+
+def _test_idt_and_interrupts(failures: List[str]) -> None:
     # ── T6: FullIDT — 256 vectors, DPL correctness, NOEC dummy ──────────────
     print("\n[T6] FullIDT — 256 descriptors, DPL, NOEC/EC, T_SYS")
     idt = FullIDT()
@@ -1777,6 +1787,16 @@ def _run_tests() -> None:
     assert ec_frames[0].error == 0xDEAD, "EC vector must preserve error code"
     print(f"  ✓ 256 vectors loaded, DPL correct, NOEC dummy=0, EC preserved")
 
+    # ── T12: LIDT string format ───────────────────────────────────────────────
+    print("\n[T12] FullIDT.lidt() — IDTR representation")
+    idt2  = FullIDT()
+    idtr  = idt2.lidt()
+    assert "limit=0x0FFF" in idtr, f"IDTR limit wrong: {idtr}"
+    assert "base=0x" in idtr
+    print(f"  ✓ {idtr}")
+
+
+def _test_pcb_and_fsm(failures: List[str]) -> None:
     # ── T7: PCB priority aging ────────────────────────────────────────────────
     print("\n[T7] PCB priority aging (Silberschatz §5.3.3)")
     pcb = ProcessControlBlock(name="test", base_priority=10)
@@ -1791,6 +1811,24 @@ def _run_tests() -> None:
     assert pcb.effective_priority() == 0, "Extreme aging must clamp to 0"
     print(f"  ✓ Aging formula correct: wait=40 → prio={expected}, extreme→0")
 
+    # ── T11: ProcessFSM state transitions ─────────────────────────────────────
+    print("\n[T11] ProcessFSM — illegal transition rejection")
+    pt3   = ProcessTable()
+    pcb3  = ProcessControlBlock(name="fsm_test", base_priority=10)
+    pt3.insert(pcb3)
+    # NEW → RUNNING is illegal (must go NEW→READY→RUNNING)
+    try:
+        pt3.transition(pcb3.pid, ProcessState.RUNNING)
+        failures.append("T11: Should have rejected NEW→RUNNING")
+    except ValueError:
+        pass
+    # NEW → READY is valid
+    pt3.transition(pcb3.pid, ProcessState.READY)
+    assert pcb3.state == ProcessState.READY
+    print("  ✓ NEW→RUNNING rejected, NEW→READY accepted")
+
+
+def _test_scheduler_and_syscalls(failures: List[str]) -> None:
     # ── T8: Scheduler FIFO + preemption ──────────────────────────────────────
     print("\n[T8] RoundRobinScheduler: admit, tick, preemption")
     pt   = ProcessTable()
@@ -1851,38 +1889,20 @@ def _run_tests() -> None:
     assert sched2.current_process.ticks_remaining == 0, "YIELD must zero quantum"
     print(f"  ✓ SYS_GETPID={pcb2.pid}, SYS_YIELD zeroed quantum correctly")
 
-    # ── T11: ProcessFSM state transitions ─────────────────────────────────────
-    print("\n[T11] ProcessFSM — illegal transition rejection")
-    pt3   = ProcessTable()
-    pcb3  = ProcessControlBlock(name="fsm_test", base_priority=10)
-    pt3.insert(pcb3)
-    # NEW → RUNNING is illegal (must go NEW→READY→RUNNING)
-    try:
-        pt3.transition(pcb3.pid, ProcessState.RUNNING)
-        failures.append("T11: Should have rejected NEW→RUNNING")
-    except ValueError:
-        pass
-    # NEW → READY is valid
-    pt3.transition(pcb3.pid, ProcessState.READY)
-    assert pcb3.state == ProcessState.READY
-    print("  ✓ NEW→RUNNING rejected, NEW→READY accepted")
 
-    # ── T12: LIDT string format ───────────────────────────────────────────────
-    print("\n[T12] FullIDT.lidt() — IDTR representation")
-    idt2  = FullIDT()
-    idtr  = idt2.lidt()
-    assert "limit=0x0FFF" in idtr, f"IDTR limit wrong: {idtr}"
-    assert "base=0x" in idtr
-    print(f"  ✓ {idtr}")
+def _run_tests() -> None:
+    """Run self-tests for the process manager."""
+    print("=" * 68)
+    print("  AIOS aios_process.py — Self-Test Suite")
+    print("=" * 68)
+    failures: List[str] = []
 
-    # ── T13: ERMSCapability flag ──────────────────────────────────────────────
-    print("\n[T13] ERMS fallback to CopyAligned when ERMS unavailable")
-    _ERMSCapability.set_from_hardware_profile(False)
-    dst = bytearray(4096)
-    mem_copy_erms(dst, 0, bytes(range(256)) * 16, 0, 4096)
-    assert dst == bytearray(bytes(range(256)) * 16), "ERMS fallback mismatch"
-    _ERMSCapability.set_from_hardware_profile(True)  # restore default
-    print("  ✓ Non-ERMS path falls back to CopyAligned correctly")
+    _test_loader_params(failures)
+    _test_trap_and_switch_frames(failures)
+    _test_memory_copy_and_erms(failures)
+    _test_idt_and_interrupts(failures)
+    _test_pcb_and_fsm(failures)
+    _test_scheduler_and_syscalls(failures)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 68)
