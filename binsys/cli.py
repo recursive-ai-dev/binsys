@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import sys
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -124,7 +125,7 @@ def cmd_shell(args: argparse.Namespace) -> None:
     print(f"Primary Image: {img_path}")
     print("Dropping into system shell. Type 'exit' to return.")
 
-    os.system(os.environ.get("SHELL", "/bin/bash"))
+    subprocess.run([os.environ.get("SHELL", "/bin/bash")])
 
 
 def cmd_mount(args: argparse.Namespace) -> None:
