@@ -1604,7 +1604,7 @@ class SIMDTensorBackend:
         """
         if self._np is not None:
             return self._np.matmul(A, B)
-        # Pure-Python naive GEMM
+        # Pure-Python naive GEMM (faster in interpreted Python than tiled)
         M = len(A);  K = len(A[0]);  N = len(B[0])
         C = [[0.0] * N for _ in range(M)]
         for i in range(M):
@@ -1612,7 +1612,7 @@ class SIMDTensorBackend:
             Ci = C[i]
             for k in range(K):
                 a_ik = Ai[k]
-                Bk   = B[k]
+                Bk = B[k]
                 for j in range(N):
                     Ci[j] += a_ik * Bk[j]
         return C
