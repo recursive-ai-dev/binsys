@@ -1036,12 +1036,8 @@ class AIOSScheduler:
         numa_dist: Dict[int, Dict[int, int]] = {}
         for node in nodes:
             src = node.node_id
-            numa_dist[src] = {}
-            for dst_id, dist in node.distances.items():
-                numa_dist[src][dst_id] = dist
-            # Ensure reflexive entry
-            if src not in numa_dist[src]:
-                numa_dist[src][src] = 10
+            numa_dist[src] = {src: 10}
+            numa_dist[src].update(node.distances)
 
         scorer     = PlacementScorer(numa_dist)
         rebalancer = AdaptiveRebalancer(workers, numa_dist)
