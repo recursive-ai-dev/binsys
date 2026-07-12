@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import base64
 import getpass
 import hashlib
 import hmac

@@ -1672,12 +1672,21 @@ class Tensor:
         if k != k2:
             raise ValueError(f"Incompatible shapes {self._shape} @ {other._shape}")
         out = Tensor(shape=(m, n), dtype=self._dtype)
-        for i in range(m):
-            for j in range(n):
-                s = 0.0
-                for p in range(k):
-                    s += self._buffer[i * k + p] * other._buffer[p * n + j]
-                out._buffer[i * n + j] = s
+
+        # Optimize loops using map, zip, array slice & transpose
+        import operator
+        other_T = other.T()
+        buf1 = self._buffer
+        buf2_T = other_T._buffer
+
+        # Extract rows and cols
+        rows_A = [buf1[i * k : (i + 1) * k] for i in range(m)]
+        cols_B = [buf2_T[j * k : (j + 1) * k] for j in range(n)]
+
+        out._buffer[:] = array.array(
+            self._dtype.fmt,
+            (sum(map(operator.mul, row_A, col_B)) for row_A in rows_A for col_B in cols_B)
+        )
         return out
  
     def sum(self, axis: Optional[int] = None) -> "Tensor":
