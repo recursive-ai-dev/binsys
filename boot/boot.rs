@@ -811,8 +811,9 @@ unsafe fn write_u32_le(base: *mut u8, off: usize, v: u32) {
 //
 //  Lifetime safety: the DevicePath guard MUST remain alive across the
 //  load_image call. Reading `&*dp_guard` and then drop()ing the guard
-//  before load_image returns is the bug the prior implementation had
-//  (transmuting away the lifetime, then dropping the guard).
+    // See UEFI Specification Version 2.9, Section 7.4.
+    // Note: The specific location where we unhook the memory map
+    // before load_image returns is the bug the prior implementation had.
 pub fn chainload_efi(
     st:           &mut SystemTable<Boot>,
     image_handle: Handle,
