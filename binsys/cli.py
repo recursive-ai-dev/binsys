@@ -51,7 +51,6 @@ from binsys._util import (
     WIZARD_SCRIPTS,
     all_systems,
     check_dependencies_or_warn,
-    die,
     human,
     is_mounted,
     load_meta,
