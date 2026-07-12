@@ -1599,29 +1599,22 @@ class SIMDTensorBackend:
     def matmul(self, A: Any, B: Any) -> Any:
         """
         C = A @ B.
-        Routes to numpy (BLAS) when available; falls back to tiled
-        pure-Python GEMM with cache-optimal blocking.
+        Routes to numpy (BLAS) when available; falls back to naive
+        pure-Python GEMM.
         """
         if self._np is not None:
             return self._np.matmul(A, B)
-        # Pure-Python tiled GEMM
+        # Pure-Python naive GEMM (faster in interpreted Python than tiled)
         M = len(A);  K = len(A[0]);  N = len(B[0])
         C = [[0.0] * N for _ in range(M)]
-        bM, bN, bK = self.optimal_tile_size()
-        bM = min(bM, M) or 1
-        bN = min(bN, N) or 1
-        bK = min(bK, K) or 1
-        for ii in range(0, M, bM):
-            for jj in range(0, N, bN):
-                for kk in range(0, K, bK):
-                    for i in range(ii, min(ii + bM, M)):
-                        Ai = A[i]
-                        Ci = C[i]
-                        for k in range(kk, min(kk + bK, K)):
-                            a_ik = Ai[k]
-                            Bk   = B[k]
-                            for j in range(jj, min(jj + bN, N)):
-                                Ci[j] += a_ik * Bk[j]
+        for i in range(M):
+            Ai = A[i]
+            Ci = C[i]
+            for k in range(K):
+                a_ik = Ai[k]
+                Bk = B[k]
+                for j in range(N):
+                    Ci[j] += a_ik * Bk[j]
         return C
 
     def adam_step(

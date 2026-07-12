@@ -1040,6 +1040,8 @@ class AIOSScheduler:
             # Ensure reflexive entry
             if src not in d:
                 d[src] = 10
+            numa_dist[src] = {src: 10}
+            numa_dist[src].update(node.distances)
 
         scorer     = PlacementScorer(numa_dist)
         rebalancer = AdaptiveRebalancer(workers, numa_dist)
