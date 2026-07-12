@@ -1036,6 +1036,10 @@ class AIOSScheduler:
         numa_dist: Dict[int, Dict[int, int]] = {}
         for node in nodes:
             src = node.node_id
+            numa_dist[src] = d = dict(node.distances)
+            # Ensure reflexive entry
+            if src not in d:
+                d[src] = 10
             numa_dist[src] = {src: 10}
             numa_dist[src].update(node.distances)
 
