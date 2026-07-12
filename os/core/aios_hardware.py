@@ -1599,8 +1599,8 @@ class SIMDTensorBackend:
     def matmul(self, A: Any, B: Any) -> Any:
         """
         C = A @ B.
-        Routes to numpy (BLAS) when available; falls back to tiled
-        pure-Python GEMM with cache-optimal blocking.
+        Routes to numpy (BLAS) when available; falls back to naive
+        pure-Python GEMM.
         """
         if self._np is not None:
             return self._np.matmul(A, B)
