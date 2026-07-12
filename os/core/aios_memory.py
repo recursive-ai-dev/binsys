@@ -473,11 +473,11 @@ class EpisodicMemory:
         """
         Commit a new episode.
 
-        Returns the assigned episode ID (sha1 of timestamp + content repr,
+        Returns the assigned episode ID (sha256 of timestamp + content repr,
         truncated to 16 hex chars).
         """
         ts    = time.monotonic()
-        ep_id = hashlib.sha1(
+        ep_id = hashlib.sha256(
             f"{ts}{repr(content)}".encode()
         ).hexdigest()[:16]
 
@@ -642,7 +642,7 @@ class SemanticMemory:
         rather than inserting a duplicate. Returns fact_id.
         """
         norm_key = _l2_normalise(key_emb)
-        fact_id  = hashlib.sha1(repr(norm_key[:4]).encode()).hexdigest()[:16]
+        fact_id  = hashlib.sha256(repr(norm_key[:4]).encode()).hexdigest()[:16]
 
         with self._lock:
             # Search for near-duplicate (O(N) — acceptable for N ≤ 2048)

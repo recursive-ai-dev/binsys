@@ -183,7 +183,7 @@ class TaskSpec:
     deadline_ns:      Optional[int]              = None
     data_size_bytes:  int                        = 0
     task_id:          str = field(
-        default_factory=lambda: hashlib.sha1(
+        default_factory=lambda: hashlib.sha256(
             str(time.monotonic_ns()).encode()
         ).hexdigest()[:12]
     )
