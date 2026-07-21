@@ -266,6 +266,8 @@ class EvdevInputDriver:
             except OSError:
                 pass
         self._fds = []
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
 
     def _run(self) -> None:
         buf = bytearray(_EVDEV_SZ)
@@ -552,10 +554,13 @@ class PtyManager:
                     if not data:
                         self._alive = False
                         break
-                    try:
-                        self._q.put_nowait(data)
-                    except queue.Full:
-                        pass
+
+                    while self._alive:
+                        try:
+                            self._q.put(data, timeout=0.1)
+                            break
+                        except queue.Full:
+                            pass
             except OSError:
                 self._alive = False
                 break
@@ -593,6 +598,8 @@ class PtyManager:
             except OSError:
                 pass
             self.master_fd = None
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
 
     @property
     def alive(self) -> bool:
@@ -1204,6 +1211,8 @@ class CAWallpaper:
 
     def stop(self) -> None:
         self._alive = False
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
 
     def _run(self) -> None:
         interval = 1.0 / _CA_FPS
@@ -1602,6 +1611,8 @@ class Taskbar:
 
     def stop(self) -> None:
         self._alive = False
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
 
     def _run(self) -> None:
         while self._alive:
